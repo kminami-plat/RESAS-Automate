@@ -1,0 +1,6 @@
+*.pyc
+.env
+.venv/
+__pycache__/
+cache/
+todo.txt

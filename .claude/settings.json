@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./.envrc)",
+      "Edit(./.env)",
+      "Edit(./.env.*)",
+      "Edit(./.envrc)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Edit|Write|NotebookEdit|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=$(cat); T=$(printf '%s' \"$P\" | jq -r '.tool_name // \"\"' 2>/dev/null); if [ \"$T\" = \"Bash\" ]; then S=$(printf '%s' \"$P\" | jq -r '.tool_input.command // \"\"' 2>/dev/null); else S=$(printf '%s' \"$P\" | jq -r '[.tool_input.file_path,.tool_input.path,.tool_input.notebook_path,.tool_input.pattern]|map(select(.!=null))|.[]' 2>/dev/null); fi; if printf '%s\\n' \"$S\" | grep -Eq '\\.env(rc)?([.-][A-Za-z0-9_-]+)*([^A-Za-z0-9_.-]|$)'; then printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"秘密情報保護のため .env / .env.* / .envrc へのアクセスはブロックされています。Bash 経由 (cat, head, sed, grep, less, source, cp など) も対象です。値が必要な場合は環境変数名で参照するか、プログラム側で .env を読み込ませてください。\"}}'; fi",
+            "statusMessage": ".env ガードを確認中"
+          }
+        ]
+      }
+    ]
+  }
+}

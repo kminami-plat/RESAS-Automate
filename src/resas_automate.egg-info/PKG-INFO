@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: resas-automate
+Version: 0.1.0
+Summary: 米沢市／置賜の滞在人口・From-to・宿泊者数CSVを公的オープンデータから生成する
+Requires-Python: >=3.10
