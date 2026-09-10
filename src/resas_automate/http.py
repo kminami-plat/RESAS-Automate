@@ -44,11 +44,19 @@ def fetch(url: str, *, retries: int = 3, timeout: int = 120) -> bytes:
     raise RuntimeError(f"取得できませんでした: {url}") from last
 
 
-def fetch_cached(url: str, cache_dir: Path, *, suffix: str = "") -> Path:
-    """URLをダウンロードしてキャッシュし、ローカルパスを返す。"""
+def fetch_cached(
+    url: str, cache_dir: Path, *, suffix: str = "", name: str | None = None
+) -> Path:
+    """URLをダウンロードしてキャッシュし、ローカルパスを返す。
+
+    ``name`` を渡すとキャッシュのファイル名に使う。URLのパスに意味が無い
+    配信（e-Statの ``file-download?statInfId=…`` など）で、
+    cache/ を人が読める状態に保つため。
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha256(url.encode()).hexdigest()[:16]
-    name = Path(urllib.parse.urlparse(url).path).name or "download"
+    if name is None:
+        name = Path(urllib.parse.urlparse(url).path).name or "download"
     path = cache_dir / f"{key}_{name}{suffix}"
     if path.exists() and path.stat().st_size > 0:
         log.info("キャッシュを利用: %s", path.name)

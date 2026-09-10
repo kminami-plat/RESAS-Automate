@@ -5,6 +5,12 @@ description = "米沢市／置賜の滞在人口・From-to・宿泊者数CSVを�
 requires-python = ">=3.10"
 dependencies = []          # 標準ライブラリのみで動作する
 
+# ブラウザ経由の取得は「配信元がJS専用に変わった場合」の逃げ道であり、
+# 通常運転では不要（e-Statのファイル配布はプレーンHTTPで辿れる）。
+# 本体の依存にはしない。  pip install -e ".[browser]"
+[project.optional-dependencies]
+browser = ["selenium>=4.6"]
+
 [project.scripts]
 resas-automate = "resas_automate.cli:main"
 

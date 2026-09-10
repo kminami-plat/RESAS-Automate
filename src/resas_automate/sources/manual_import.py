@@ -50,7 +50,30 @@ def _decode(path: Path) -> str:
 
 
 def _rows(path: Path) -> list[list[str]]:
+    """CSV/TSV/Excel のどれでも「行のリスト」に揃えて返す。
+
+    e-Statのファイル配布はExcelしか置いていない表があるため、
+    手動DLしたブックもそのまま input/ に置けるようにしている。
+    宿泊旅行統計調査のブックは自動取得できる（`fetch --lodging-source files`）ので、
+    この経路は「県や市の観光統計をExcelでもらった」場合が主な用途。
+    """
+    if path.suffix.lower() in {".xlsx", ".xlsm"}:
+        return _xlsx_rows(path)
     return [r for r in csv.reader(io.StringIO(_decode(path))) if any(c.strip() for c in r)]
+
+
+def _xlsx_rows(path: Path) -> list[list[str]]:
+    """Excelの全シートを縦に連結して返す（見出し行の探索は既存ロジックに任せる）。"""
+    from .. import xlsx
+
+    with xlsx.Workbook(path) as book:
+        out: list[list[str]] = []
+        for name in book.sheets:
+            rows = [r for r in book.rows(name) if any(str(c).strip() for c in r)]
+            if rows:
+                log.debug("%s: シート '%s' から %d行", path.name, name, len(rows))
+                out.extend(rows)
+        return out
 
 
 # 「滞在人口率」「構成比」など、実数ではない派生列を掴まないための減点語
@@ -179,11 +202,18 @@ def import_lodging(path: Path) -> list[tuple[str, int, int]]:
 IMPORTERS = {"stay": import_stay, "fromto": import_fromto, "lodging": import_lodging}
 
 
+INPUT_SUFFIXES = ("*.csv", "*.xlsx", "*.xlsm")
+
+
 def find_input(input_dir: Path, kind: str) -> Path:
-    """input/ から対象CSVを1つ選ぶ。kind名を含むファイルを優先する。"""
-    candidates = sorted(p for p in input_dir.glob("*.csv") if p.is_file())
+    """input/ から対象ファイルを1つ選ぶ。kind名を含むファイルを優先する。"""
+    candidates = sorted(
+        p for pattern in INPUT_SUFFIXES for p in input_dir.glob(pattern) if p.is_file()
+    )
     if not candidates:
-        raise RuntimeError(f"{input_dir} にCSVがありません。RESASからCSVを出力して置いてください。")
+        raise RuntimeError(
+            f"{input_dir} にCSV/Excelがありません。RESASやe-Statから出力して置いてください。"
+        )
     named = [p for p in candidates if kind in p.name.lower()]
     chosen = (named or candidates)[0]
     if len(named or candidates) > 1:

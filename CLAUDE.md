@@ -8,7 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 山形県米沢市の「滞在人口 / From-to（流入元）/ 宿泊者数」を公的オープンデータから取得し、
 **列名が固定された3つのCSV**（`resas-stay.csv` / `resas-fromto.csv` / `resas-lodging.csv`）を
-リポジトリ直下に生成する。列仕様は `writers.HEADERS` が単一の情報源。
+`data/raw/resas/` に生成する（出力先は `cli.DEFAULT_OUT`。`--out` で変更可）。
+同名の `.md`（出典・制約）も同じディレクトリに並べて出す。
+列仕様は `writers.HEADERS` が単一の情報源。
 
 外部依存ゼロ（標準ライブラリのみ）。この方針は維持すること。
 
@@ -22,14 +24,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # 実行
 .venv/bin/resas-automate fetch                        # 3種まとめて
 .venv/bin/resas-automate fetch --kind fromto -v       # 種別を絞る／詳細ログ
-.venv/bin/resas-automate estat-meta                   # e-Stat統計表の分類コードを一覧（デバッグの起点）
+.venv/bin/resas-automate fetch --kind lodging --lodging-area city   # 米沢市の月次宿泊者数
+.venv/bin/resas-automate estat-meta                   # API側の分類コードを一覧
+.venv/bin/resas-automate estat-files                  # ファイル配布側の収録年月を一覧
 
 # 構文チェック（テストスイートは無い）
 .venv/bin/python -m compileall -q src
 ```
 
-`pip install -e .` 後に **新しいモジュールを追加したら再インストール不要**（`.pth` 参照）だが、
-`.venv/bin/python -c "import resas_automate"` が通らなくなったら venv が壊れている。作り直す。
+### この環境では `.venv/bin/resas-automate` が動かないことがある
+
+`pip install -e .` 後に **新しいモジュールを追加したら再インストール不要**（`.pth` 参照）。
+ただし本リポジトリは iCloud同期下の Desktop にあり、**同期が `.venv` 配下に
+macOSの `hidden` フラグ（`UF_HIDDEN`）を付け直す**。
+Python 3.13以降の `site.addpackage` は **hidden な `.pth` を黙って無視する**ため、
+editable install が効かず `ModuleNotFoundError: No module named 'resas_automate'` になる。
+
+`chflags nohidden` は同期で戻されるので恒久策にならない。**venvを作り直しても直らない。**
+確実に動かすなら次のどれか:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m resas_automate fetch   # 一番手軽。CIでもこれ
+.venv/bin/python -m pip install .                         # 非editable（.pth不要）にする
+```
+
+リポジトリを iCloud 同期外（例 `~/src/`）へ移すのが根本解決。
 
 ## 前提：RESAS本体からは何も取れない
 
@@ -48,20 +67,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `cli.py` がオーケストレーション、`sources/*` が取得元ごとのアダプタ、`writers.py` が出力の門番。
 sources は互いに独立で、`cli.cmd_fetch` だけが束ねる。
 
+`xlsx.py` は標準ライブラリだけのxlsx読み取り（openpyxl を入れないため）。
+書式を解釈せず結合セルも展開しないので、**見出しは `xlsx.norm()` を通して
+名称マッチで解決する**（政府統計のセルにはルビと注記がくっついてくる）。
+
 各 source は「取れる全期間を返す」だけで、**期間の絞り込みはしない**（`cli` の責務）。
 `mlit_jinryu.load()` / `estat_lodging.fetch_lodging()` が期間引数を持たないのは意図的。
 
 ### 取得元ごとに収録範囲の天井が違う
 
-| source | 収録範囲 | 鍵 |
-|---|---|---|
-| `mlit_jinryu` | 2019-01〜2021-12 | 不要 |
-| `estat_census_fromto` | 2020年（国勢調査） | 要 |
-| `estat_lodging` | 2014-01〜2016-12 | 要 |
+| source | 収録範囲 | 鍵 | 経路 |
+|---|---|---|---|
+| `mlit_jinryu` | 2019-01〜2021-12 | 不要 | 配信ZIP |
+| `estat_census_fromto` | 2020年（国勢調査） | 要 | e-Stat API |
+| `estat_lodging` | 2014-01〜2016-12 | 要 | e-Stat API（統計データベース） |
+| `estat_lodging_files`（宿泊者数） | 2015年〜**最新月** | 不要 | e-Stat ファイル配布のExcel |
+| `estat_lodging_files`（From-to） | 2015-04〜**最新月** | 不要 | 同上（参考第2表・居住地別） |
 
 天井がバラバラなので `cli.select_year_months()` が**ソースごとに独立して**
 「今年 → 無ければ収録最新年」へフォールバックする。既定実行では stay=2021年、
-lodging=2016年 と別々の年が出るのが正常。
+lodging=最新年 と別々の年が出るのが正常。
 
 ### 列名と中身が一致しない箇所がある（意図的）
 
@@ -73,16 +98,84 @@ lodging=2016年 と別々の年が出るのが正常。
 **出典・集計条件・制約は同名の `.md` に必ず書き出す**。
 新しい source を足すときも sidecar は必須。CSVだけ出して済ませないこと。
 
-### e-Stat API の扱い
+### e-Stat には「統計データベース」と「ファイル配布」の2経路がある
 
-- **`statsDataId` は期間固有で、時系列の通し番号ではない**。`0003314421` は2014-2016しか持たない。
-  「同じ表の最新版」は別IDで存在するとは限らず、宿泊旅行統計調査の2017年以降は
-  そもそもDB登録されておらずファイル配布のみ（`getStatsData` から取得不可）。
+これを混同すると「宿泊者数は2016年まで」という誤った結論に戻るので注意。
+
+- **統計データベース（`getStatsData` / `estat_lodging.py`）**
+  `statsDataId` は**期間固有で、時系列の通し番号ではない**。`0003314421` は2014-2016しか持たない。
+  「同じ表の最新版」が別IDで存在するとは限らず、宿泊旅行統計調査の2017年以降は
+  そもそもDB登録が無い（`getStatsList` に `statsCode=00601020` を投げても
+  32表・全て2014-2016）。**APIをどう叩いても2017年以降は出てこない。**
+
+- **ファイル配布（`estat_files.py` + `estat_lodging_files.py`）**
+  2017年以降はExcelでのみ配布されている。ファイル検索画面はJSレンダリングだが、
+  画面自身が叩いている **`/retrieve/api_file` がプレーンHTTPでJSONを返す**
+  （ログイン・トークン不要）。よって**Seleniumは不要**で標準ライブラリだけで辿れる。
+  階層は 政府統計(toukei) → 提供統計(tstat) → 提供周期(cycle) → 調査年月 → statInfId。
+  `month` は `11010302` のような8桁コードなので、**組み立てず一覧のリンクから読む**。
+
+  ブラウザ経路（`sources/browser.py`・Selenium）は配信元がJS専用に変わった場合の
+  逃げ道として `--use-browser` の裏にだけ置いてある。**任意依存**（`pip install -e ".[browser]"`）で、
+  本体の「外部依存ゼロ」は崩していない。
 - **分類コードはハードコードせず、`getMetaInfo` の名称マッチで解決する**
   （`_find_obj` / `_find_code`）。表の改訂で番号が変わっても壊れにくくするため。
   解決に失敗したら `estat-meta` で実際の分類を見るのが定石。
 - レスポンスの封筒は `GET_META_INFO` / `GET_STATS_DATA` の下。`_call()` が剥がして
   `RESULT.STATUS != 0` を `EstatError` に変換する。生の `fetch_json` を直接使わないこと。
+
+### Excelの表は「番号」ではなく「タイトルの語」で特定する
+
+宿泊旅行統計調査は改訂のたびに表番号も集計区分も変わる。実測（2026-09）:
+
+| | 施設規模の区分 | 全施設 | 市区町村別 |
+|---|---|---|---|
+| 年確定値（〜2025年） | 従業者数 | 第2表 | **無い** |
+| 第2次速報値（2015-04〜） | 客室数 | 第2表 | 参考第6表（総数）／参考第8表（外国人） |
+| 第1次速報値 | ― | **全国計のみ** | 無い |
+
+`estat_lodging_files._SHEET_RULES` は必須語・除外語でシートを選ぶ。
+シート名や番号でマッチさせないこと（`参考第3表` は年確定値では
+「従業者数10人以上の延べ宿泊者数」だが、第2次速報値では
+「居住地別延べ宿泊者数」で全く別物）。
+
+**第1次速報値は候補に入れない**（`PREFER_PREF` / `PREFER_CITY`）。
+全国計しか無いので、最新月ほしさに入れると毎回ダウンロードして必ず空振りする。
+
+### From-to を最新化する手は無い（`--fromto-source lodging` は代用にならない）
+
+「宿泊と同じ要領で fromto も最新化できないか」は既に検討済み。結論は**できない**。
+
+- **国勢調査 従業地・通学地集計は令和2年（2020年）が最新**。令和7年調査は実施済みだが
+  この集計は未公表（令和2年は調査の約2年後に公表）。DBにもファイル配布にも無い。
+- **人流オープンデータは凍結**。山形県リソースの `last_modified` は 2022-01-13 で、
+  中身は 2019〜2021 のまま（CKAN で確認済み）。2022年以降は存在しない。
+
+唯一「最新の流入元らしきもの」は宿泊旅行統計の**参考第2表（居住地47区分別延べ宿泊者数）**で、
+`--fromto-source lodging` で取れる。ただし**既定にはしない**。実測（2026年）での制約:
+
+| 制約 | 中身 |
+|---|---|
+| 地域 | **山形県**単位。米沢市の居住地内訳は存在しない |
+| 対象施設 | 大規模施設のみ。しかも**月で変わる**（2〜4月=20室以上 / 5〜6月=200室以上） |
+| カバー率 | 県の全施設 延べ宿泊者数の数%（2026-06 は 12,098 / 383,880 ＝ 3.2%） |
+| 居住地不詳 | 総数の **0〜30%**（2026-04 は 30.3% で不詳が最大カテゴリ） |
+| 確報 | 年確定値に居住地47区分の表は無いので、確報に置き換わらない |
+
+運輸局の列（北海道運輸局〜沖縄総合事務局）は都道府県の積み上げなので**必ず落とす**。
+`read_fromto()` は内訳合計が総数を**超えたら例外**（＝集計列を拾ったバグ）、
+**下回ったら差分を「不詳」行に立てる**（＝実データの仕様）。この非対称は意図的。
+
+### 米沢市の月次宿泊者数は取れる（README の旧記述は誤り）
+
+第2次速報値の参考第6表・第8表が「施設所在地（主な市区町村）」別で、
+**山形県米沢市が載っている**（例 2026-06: 延べ15,163人泊 / うち外国人191）。
+`--lodging-area city` がこれを使う。ただし:
+
+- 掲載は「主な市区町村」のみで、**掲載される市区町村は月によって変わる**
+  （2026-03 は米沢市の行が無い）。月が飛ぶのは異常ではない。取れた月だけ出し、
+  抜けは sidecar の「欠測」に書く。
+- 年確定値に市区町村別は無いので、**この値が確報に置き換わることはない**。
 
 ### 市区町村コードは必ず検証する
 
@@ -103,6 +196,26 @@ lodging=2016年 と別々の年が出るのが正常。
   `--fromto-top` で絞っても「その他」を含めた合計はこの値。
 - `resas-stay.csv` 2021-08 の米沢市 = **88,834**。
 - `mlit_jinryu` は発地4区分の合算が総滞在人口。
+
+宿泊（2つの経路が同じ値を出すことが一番効く検証）:
+
+- **API経路とファイル配布経路は2016年で一致する**。
+  `fetch --kind lodging --lodging-source api --year 2016` と
+  `--lodging-source files --lodging-table over10 --year 2016` の出力は**完全一致**する
+  （2016-01 山形県 = 301,410 / 9,080）。ここがズレたらExcel側の列解決のバグ。
+- 同じ2016-01でも `--lodging-table all`（全施設）は **393,130 / 12,330** で、
+  `over10` とは別系列。**違って正しい**。
+- 2026-06 山形県（第2次速報・全施設）= **383,880 / 12,660**、
+  同月の米沢市 = **15,163 / 191**。
+
+From-to:
+
+- `--fromto-source census`（既定）の合計は **10,423**（上記のとおり）。
+- `--fromto-source lodging --fromto-month 2026-06` は
+  47都道府県＋国外の48件で合計 **12,098**（不詳0）。山形県3,190 / 宮城県1,805 / 東京都974。
+  `--fromto-top` で絞っても「その他」込みの合計はこの値。
+- 同 `--fromto-month 2026-04` は不詳 **9,572（30.3%）** が立ち、合計 **31,588**。
+  不詳行が消えていたら差分処理のバグ。
 
 コードを変えたら該当する数値が動いていないか確認する。ズレたら集計ロジックのバグ。
 

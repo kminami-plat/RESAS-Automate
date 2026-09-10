@@ -10,10 +10,19 @@ import sys
 from pathlib import Path
 
 from . import areas, writers
-from .sources import estat_census_fromto, estat_lodging, manual_import, mlit_jinryu
+from .sources import (
+    estat_census_fromto,
+    estat_files,
+    estat_lodging,
+    estat_lodging_files,
+    manual_import,
+    mlit_jinryu,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_OUT = ROOT
+# CSVと sidecar の .md はここに出す。ダッシュボード側（resas-process.py）が
+# 読む「生データ置き場」の相対パスに合わせてある。--out で変更可。
+DEFAULT_OUT = ROOT / "data" / "raw" / "resas"
 DEFAULT_CACHE = ROOT / "cache"
 DEFAULT_INPUT = ROOT / "input"
 DOTENV_PATH = ROOT / ".env"
@@ -206,6 +215,13 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                 log.error("国勢調査 従業地・通学地集計の取得に失敗: %s", exc)
                 failures.append("国勢調査 従業地・通学地集計")
 
+    elif "fromto" in kinds and args.fromto_source == "lodging":
+        try:
+            _fetch_fromto_lodging(args, out_dir, cache_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.error("宿泊旅行統計（居住地別）の取得に失敗: %s", exc)
+            failures.append("宿泊旅行統計（居住地別）")
+
     elif "fromto" in kinds and monthly:
         rows, ym = mlit_jinryu.fromto_rows(monthly, target, month=args.fromto_month)
         path = writers.write("fromto", rows, out_dir)
@@ -226,70 +242,378 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         )
 
     if "lodging" in kinds:
-        app_id = resolve_app_id("宿泊者数")
-        if not app_id:
+        try:
+            _fetch_lodging(args, out_dir, cache_dir, explicit_months, resolve_app_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("宿泊旅行統計調査の取得に失敗: %s", exc)
             failures.append("宿泊旅行統計調査")
-        else:
-            try:
-                everything = estat_lodging.fetch_lodging(app_id, pref_name=args.pref)
-                by_month = {r[0]: r for r in everything}
-                lodging_year: int | None = None
-                if explicit_months:
-                    missing = sorted(set(explicit_months) - by_month.keys())
-                    if missing:
-                        log.warning(
-                            "宿泊旅行統計調査（API取得範囲 %s〜%s）に未収録の年月: %s",
-                        estat_lodging.AVAILABLE_FROM,
-                        estat_lodging.AVAILABLE_TO,
-                        ", ".join(missing),
-                        )
-                    months = [m for m in explicit_months if m in by_month]
-                else:
-                    months, lodging_year = select_year_months(
-                        sorted(by_month), args.year
-                    )
-                if not months:
-                    raise RuntimeError("対象年月に該当するデータがありません")
-                rows = [by_month[m] for m in months]
-                log.info("宿泊者数の対象期間: %s〜%s", months[0], months[-1])
-                path = writers.write("lodging", rows, out_dir)
-                writers.sidecar_note(
-                    path,
-                    [
-                        "# resas-lodging.csv の出典",
-                        "",
-                        f"- 対象: {args.pref}（延べ宿泊者数 / うち外国人）",
-                        f"- 対象期間: {rows[0][0]}〜{rows[-1][0]}（年月の昇順）",
-                        f"- 出典: 観光庁 宿泊旅行統計調査 参考第３表（e-Stat） {estat_lodging.SOURCE_URL}",
-                        f"- API取得範囲: {estat_lodging.AVAILABLE_FROM}〜{estat_lodging.AVAILABLE_TO}"
-                        "（このstatsDataIdはこの期間のみ「統計データベース」として登録されている）",
-                        "",
-                        "## 注意",
-                        "宿泊旅行統計調査の公表単位は都道府県であり、",
-                        f"{areas.TARGET_AREA_LABEL}単独の月次宿泊者数は全国統計としては公表されていない。",
-                        "",
-                        f"2017年以降の値はe-Stat APIから取得できない（ファイル配布のみ）。"
-                        f"必要な場合は {estat_lodging.FILES_URL} から対象月のファイルを手動DLし、",
-                        "市町村別が必要な場合とあわせて、",
-                        "`python -m resas_automate manual --kind lodging` で変換すること。",
-                    ]
-                    + (
-                        [
-                            "",
-                            f"※ {args.year}年は未公表のため、公表最新年 {lodging_year}年を出力している。",
-                        ]
-                        if lodging_year is not None and lodging_year != args.year
-                        else []
-                    ),
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.error("宿泊旅行統計調査の取得に失敗: %s", exc)
-                failures.append("宿泊旅行統計調査")
 
     if failures:
         log.error("失敗した取得元: %s", " / ".join(failures))
         return 1
     return 0
+
+
+# ------------------------------------------------------------------- fetch: 宿泊
+
+
+def _fetch_lodging(
+    args: argparse.Namespace,
+    out_dir: Path,
+    cache_dir: Path,
+    explicit_months: list[str] | None,
+    resolve_app_id,
+) -> None:
+    """宿泊者数をAPI経路／ファイル配布経路のどちらかで取得して書き出す。
+
+    `api` はe-Statの統計データベース（2014-01〜2016-12しか無い）、
+    `files` はファイル配布のExcel（2015年〜最新月）。`auto` は
+    **対象年がAPIの収録範囲に入っていればAPI、外ならファイル配布**。
+    """
+    source = args.lodging_source
+    if source == "auto":
+        in_api_range = int(estat_lodging.AVAILABLE_FROM[:4]) <= args.year <= int(
+            estat_lodging.AVAILABLE_TO[:4]
+        )
+        source = "api" if in_api_range else "files"
+        log.info("宿泊者数の取得経路: %s（--lodging-source auto の判定）", source)
+
+    if source == "api":
+        if args.lodging_area == "city":
+            raise RuntimeError(
+                "市区町村別はAPI経路では取得できません（--lodging-source files を使ってください）"
+            )
+        _fetch_lodging_api(args, out_dir, explicit_months, resolve_app_id)
+        return
+    _fetch_lodging_files(args, out_dir, cache_dir, explicit_months)
+
+
+def _fetch_lodging_api(
+    args: argparse.Namespace,
+    out_dir: Path,
+    explicit_months: list[str] | None,
+    resolve_app_id,
+) -> None:
+    app_id = resolve_app_id("宿泊者数")
+    if not app_id:
+        raise RuntimeError("e-Stat アプリケーションIDが未設定です")
+    everything = estat_lodging.fetch_lodging(app_id, pref_name=args.pref)
+    by_month = {r[0]: r for r in everything}
+    lodging_year: int | None = None
+    if explicit_months:
+        missing = sorted(set(explicit_months) - by_month.keys())
+        if missing:
+            log.warning(
+                "宿泊旅行統計調査（API取得範囲 %s〜%s）に未収録の年月: %s",
+                estat_lodging.AVAILABLE_FROM,
+                estat_lodging.AVAILABLE_TO,
+                ", ".join(missing),
+            )
+        months = [m for m in explicit_months if m in by_month]
+    else:
+        months, lodging_year = select_year_months(sorted(by_month), args.year)
+    if not months:
+        raise RuntimeError("対象年月に該当するデータがありません")
+    rows = [by_month[m] for m in months]
+    log.info("宿泊者数の対象期間: %s〜%s", months[0], months[-1])
+    path = writers.write("lodging", rows, out_dir)
+    writers.sidecar_note(
+        path,
+        [
+            "# resas-lodging.csv の出典",
+            "",
+            f"- 対象: {args.pref}（延べ宿泊者数 / うち外国人）",
+            f"- 対象期間: {rows[0][0]}〜{rows[-1][0]}（年月の昇順）",
+            f"- 出典: 観光庁 宿泊旅行統計調査 参考第３表（e-Stat API） {estat_lodging.SOURCE_URL}",
+            f"- 集計対象: 従業者数10人以上の施設（参考第３表の集計範囲）",
+            f"- API取得範囲: {estat_lodging.AVAILABLE_FROM}〜{estat_lodging.AVAILABLE_TO}"
+            "（このstatsDataIdはこの期間のみ「統計データベース」として登録されている）",
+            "",
+            "## 注意",
+            "宿泊旅行統計調査の公表単位は都道府県であり、",
+            f"この経路では{areas.TARGET_AREA_LABEL}単独の月次宿泊者数は取得できない。",
+            "",
+            "2017年以降の値はe-Stat APIから取得できない（ファイル配布のみ）。",
+            "`--lodging-source files` を使うとファイル配布のExcelから自動取得できる",
+            f"（市区町村別は `--lodging-area city`。配布元: {estat_lodging.FILES_URL}）。",
+        ]
+        + (
+            [
+                "",
+                f"※ {args.year}年は未公表のため、公表最新年 {lodging_year}年を出力している。",
+            ]
+            if lodging_year is not None and lodging_year != args.year
+            else []
+        ),
+    )
+
+
+def _fetch_lodging_files(
+    args: argparse.Namespace,
+    out_dir: Path,
+    cache_dir: Path,
+    explicit_months: list[str] | None,
+) -> None:
+    city = areas.TARGET_CITY_NAME if args.lodging_area == "city" else None
+    years = [args.year]
+    if explicit_months:
+        years = sorted({int(m[:4]) for m in explicit_months})
+
+    rows: list[tuple[str, int, int]] = []
+    # 複数年をまたぐ場合、出典は年ごとに別々に返るので1つにまとめる
+    merged = estat_lodging_files.Provenance()
+    got_any = False
+    fallback_year: int | None = None
+    for year in years:
+        try:
+            got, prov = estat_lodging_files.fetch_lodging(
+                year,
+                pref_name=args.pref,
+                city_name=city,
+                table=args.lodging_table,
+                cache_dir=cache_dir,
+                use_browser=args.use_browser,
+            )
+        except estat_lodging_files.LodgingFileError as exc:
+            if len(years) > 1:
+                log.warning("%d年は取得できませんでした: %s", year, exc)
+                continue
+            # 単年指定で空振りしたときだけ、公表済みの最新年へ切り替える
+            available = estat_lodging_files.available_years(
+                city=bool(city), use_browser=args.use_browser
+            )
+            newer = [y for y in available if y < year]
+            if not newer:
+                raise
+            fallback_year = newer[0]
+            # 「未公表」とは限らない（表の構成が違って読めない場合もある）ので理由を添える
+            log.warning(
+                "%d年を取得できなかったため、%d年に切り替えます（理由: %s）",
+                year, fallback_year, exc,
+            )
+            got, prov = estat_lodging_files.fetch_lodging(
+                fallback_year,
+                pref_name=args.pref,
+                city_name=city,
+                table=args.lodging_table,
+                cache_dir=cache_dir,
+                use_browser=args.use_browser,
+            )
+        rows.extend(got)
+        got_any = True
+        _merge_provenance(merged, prov)
+
+    if explicit_months:
+        wanted = set(explicit_months)
+        missing = sorted(wanted - {r[0] for r in rows})
+        if missing:
+            log.warning("ファイル配布に未収録の年月: %s", ", ".join(missing))
+        rows = [r for r in rows if r[0] in wanted]
+    if not rows or not got_any:
+        raise RuntimeError("対象年月に該当するデータがありません")
+    rows.sort()
+    log.info("宿泊者数の対象期間: %s〜%s", rows[0][0], rows[-1][0])
+
+    path = writers.write("lodging", rows, out_dir)
+    writers.sidecar_note(path, _lodging_files_note(args, rows, merged, fallback_year))
+
+
+def _merge_provenance(
+    into: "estat_lodging_files.Provenance", other: "estat_lodging_files.Provenance"
+) -> None:
+    """年ごとの出典を1つに畳む。提供統計が年で変わることがあるので併記する。"""
+    into.table_label = other.table_label
+    into.area_label = other.area_label
+    for field_name in ("dataset", "cycle"):
+        current = getattr(into, field_name)
+        value = getattr(other, field_name)
+        if value and value not in current.split(" / "):
+            setattr(into, field_name, f"{current} / {value}" if current else value)
+    into.files.extend(f for f in other.files if f not in into.files)
+    into.sheets.extend(s for s in other.sheets if s not in into.sheets)
+
+
+def _missing_months(rows: list[tuple[str, int, int]]) -> list[str]:
+    """出力の最初と最後の間で抜けている年月を返す。"""
+    got = {r[0] for r in rows}
+    start, end = rows[0][0], rows[-1][0]
+    out: list[str] = []
+    y, m = int(start[:4]), int(start[5:7])
+    while f"{y:04d}-{m:02d}" <= end:
+        ym = f"{y:04d}-{m:02d}"
+        if ym not in got:
+            out.append(ym)
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def _lodging_files_note(
+    args: argparse.Namespace,
+    rows: list[tuple[str, int, int]],
+    prov: "estat_lodging_files.Provenance",
+    fallback_year: int | None,
+) -> list[str]:
+    is_city = args.lodging_area == "city"
+    gaps = _missing_months(rows)
+    lines = [
+        "# resas-lodging.csv の出典",
+        "",
+        f"- 対象: {prov.area_label}（延べ宿泊者数 / うち外国人延べ宿泊者数）",
+        f"- 対象期間: {rows[0][0]}〜{rows[-1][0]}（年月の昇順）",
+    ]
+    if gaps:
+        lines.append(f"- 欠測（この期間で値が得られなかった月）: {'・'.join(gaps)}")
+    lines += [
+        f"- 出典: 観光庁 宿泊旅行統計調査 {prov.dataset}（e-Stat ファイル配布）",
+        f"  {estat_files.FILES_PAGE}?toukei={estat_files.TOUKEI_LODGING}",
+        f"- 提供周期: {prov.cycle}",
+        f"- 集計対象: {prov.table_label}",
+        f"- 使用した統計表: {'・'.join(prov.sheets)}",
+        f"- 変換元ファイル: {'・'.join(sorted(set(prov.files)))}",
+        "",
+        "## この経路について",
+        "e-Stat API（getStatsData）で取れる宿泊旅行統計調査は",
+        f"{estat_lodging.AVAILABLE_FROM}〜{estat_lodging.AVAILABLE_TO}分のみで、",
+        "2017年以降は「統計データベース」に登録されておらずファイル配布しかない。",
+        "そのため配布Excelを直接ダウンロードして変換している",
+        "（`--lodging-source files`）。ブラウザ操作は不要で、",
+        "e-Stat のファイル検索が内部で使っているJSON経路をそのまま叩いている。",
+    ]
+    if is_city:
+        lines += [
+            "",
+            "## 市区町村別であること（重要）",
+            "値は**速報値の参考表（施設所在地＝主な市区町村）**から取っている。",
+            "宿泊旅行統計調査の市区町村別集計はこの参考表にしか無く、",
+            "**年確定値には市区町村別の表が存在しない**。",
+            "したがってこの数値が年確定値に置き換わることはない",
+            "（第1次速報値→第2次速報値の改訂は入る）。",
+            "",
+            "掲載対象は「主な市区町村」に限られ、全市区町村は網羅されていない。",
+            "掲載される市区町村は月によって変わるため、月が飛ぶことがある",
+            "（上の「欠測」を参照）。都道府県計と市区町村の合計も一致しない。",
+        ]
+    else:
+        lines += [
+            "",
+            "## 系列の注意",
+            "宿泊旅行統計調査の公表単位は都道府県であり、この表は都道府県の値である。",
+            f"{areas.TARGET_AREA_LABEL}単独の月次宿泊者数が必要な場合は `--lodging-area city`。",
+            "",
+            "`--lodging-table all`（既定・全施設）と `--lodging-table over10`",
+            "（従業者数10人以上の施設＝API経路と同じ系列）では値が異なる。",
+            "例: 2016-01 山形県は all=393,130 / over10=301,410。",
+        ]
+    if "速報" in prov.dataset and not is_city:
+        lines += [
+            "",
+            "## 速報値であること",
+            f"出典は{prov.dataset}であり、のちに年確定値へ置き換わる。",
+            "確定後に再実行すると値が変わる。",
+        ]
+    if fallback_year is not None:
+        lines += [
+            "",
+            f"※ {args.year}年は取得できなかったため、{fallback_year}年を出力している"
+            "（未公表、または指定した集計対象の表がその年に無い）。",
+        ]
+    return lines
+
+
+# ------------------------------------------------------------------ fromto: 宿泊
+
+
+def _fetch_fromto_lodging(
+    args: argparse.Namespace, out_dir: Path, cache_dir: Path
+) -> None:
+    """宿泊者の居住地別内訳を流入元として書き出す（都道府県単位・月次）。"""
+    result, prov = estat_lodging_files.fetch_fromto(
+        pref_name=args.pref,
+        month=args.fromto_month,
+        cache_dir=cache_dir,
+        use_browser=args.use_browser,
+    )
+    shown = _top_with_other(result.rows, args.fromto_top)
+    path = writers.write("fromto", shown, out_dir)
+    log.info(
+        "流入元: %d件（%s への延べ宿泊者数 %d人泊・%s・%s）",
+        len(shown), prov.area_label, result.total, prov.year_month, result.scope,
+    )
+    unknown_share = result.unknown / result.total * 100 if result.total else 0.0
+    writers.sidecar_note(
+        path,
+        [
+            "# resas-fromto.csv の出典",
+            "",
+            f"- 対象地域: {prov.area_label}（に宿泊した人の居住地）",
+            f"- 対象年月: {prov.year_month}"
+            "（列仕様に年月が無いため、単月のスナップショット）",
+            f"- 出典: 観光庁 宿泊旅行統計調査 {prov.dataset}（e-Stat ファイル配布）",
+            f"  {estat_files.FILES_PAGE}?toukei={estat_files.TOUKEI_LODGING}",
+            f"- 集計対象: {prov.table_label}",
+            f"- 使用した統計表: {'・'.join(prov.sheets)}",
+            f"- 変換元ファイル: {'・'.join(prov.files)}",
+            f"- 合計: {result.total:,}人泊（表の「総数」と一致）",
+            f"- うち居住地不詳: {result.unknown:,}人泊（{unknown_share:.1f}%）",
+            "- 並び: 人泊の降順"
+            + (f"、上位{args.fromto_top}件＋その他" if args.fromto_top else "、全件"),
+            "",
+            "## この数値が何であるか（重要）",
+            "値は**延べ宿泊者数（人泊）**であり、通勤・通学者数でも滞在人口でもない。",
+            "列名は仕様に合わせて `滞在人口` としている。",
+            "",
+            "### 4つの制約",
+            "",
+            f"1. **地域が{areas.TARGET_AREA_LABEL}ではなく{prov.area_label}**。",
+            "   この表の施設所在地は47都道府県単位で、市区町村別の居住地内訳は存在しない。",
+            "",
+            f"2. **大規模施設のみ**（この月は{result.scope}）。"
+            f"同月の{prov.area_label}の全施設 延べ宿泊者数に対し、",
+            f"   この表の総数は {result.total:,}人泊にとどまる（実測で数%）。",
+            "   大型施設に偏った標本であり、県全体の流入元構成とは一致しない。",
+            "   **対象施設の範囲は月によって変わる**（2026年は2〜4月が客室数20室以上、",
+            "   5〜6月が200室以上）。月をまたいだ比較はそのままではできない。",
+            "",
+        ]
+        + (
+            [
+                f"3. **居住地不詳が {unknown_share:.1f}%**。表の総数と47都道府県＋国外の",
+                "   内訳の合計が一致しないため、差分を「不詳」として1行に立てている。",
+                "   構成比を出すときは不詳の扱いを決めること。",
+            ]
+            if result.unknown
+            else [
+                "3. **この月は居住地不詳なし**（総数と内訳の合計が一致）。",
+                "   ただし月によっては総数の最大30%が都道府県に割り当てられておらず、",
+                "   その場合は差分を「不詳」として1行に立てる。月次で比較するなら注意。",
+            ]
+        )
+        + [
+            "",
+            "4. **速報値**。第2次速報値であり、のちに改訂されうる。",
+            "   ただし年確定値には居住地47区分の表が無いため、確報での置き換えは行われない。",
+            "",
+            "## 他の経路",
+            "自治体名単位が必要なら `--fromto-source census`（既定）。",
+            "ただしそちらは2020年国勢調査の通勤・通学者数で、月次でも観光でもない。",
+            "同市区町村/同都道府県/同地方/それ以外の4区分でよければ `--fromto-source jinryu`",
+            "（2019-01〜2021-12）。",
+        ],
+    )
+
+
+def _top_with_other(rows: list[tuple[str, int]], top: int) -> list[tuple[str, int]]:
+    """上位 top 件＋残りを「その他」に集約する。top=0 なら全件。
+
+    「その他」を含めた合計は元の合計と一致する（検証で効くので崩さないこと）。
+    """
+    if not top or len(rows) <= top:
+        return list(rows)
+    head = list(rows[:top])
+    rest = sum(v for _, v in rows[top:])
+    if rest:
+        head.append(("その他", rest))
+    return head
 
 
 # -------------------------------------------------------------------------- manual
@@ -334,6 +658,15 @@ def cmd_estat_meta(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------- estat-files
+
+
+def cmd_estat_files(args: argparse.Namespace) -> int:
+    """ファイル配布側に何年分あるかを見る。`--lodging-source files` の下調べ用。"""
+    print(estat_files.describe(use_browser=args.use_browser))
+    return 0
+
+
 # -------------------------------------------------------------------------- sample
 
 
@@ -375,7 +708,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     def common(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("--out", default=str(DEFAULT_OUT), help="CSV出力先ディレクトリ")
+        sp.add_argument(
+            "--out",
+            default=str(DEFAULT_OUT),
+            help="CSV出力先ディレクトリ（既定 data/raw/resas。同名の .md もここに出る）",
+        )
         sp.add_argument(
             "--kind",
             action="append",
@@ -405,9 +742,11 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument(
         "--fromto-source",
         default="census",
-        choices=["census", "jinryu"],
-        help="流入元の取得元。census=国勢調査（自治体名単位・既定）／"
-        "jinryu=人流オープンデータ（発地4区分・月次）",
+        choices=["census", "jinryu", "lodging"],
+        help="流入元の取得元。census=国勢調査（自治体名単位・2020年・既定）／"
+        "jinryu=人流オープンデータ（発地4区分・2019-2021）／"
+        "lodging=宿泊旅行統計の居住地別（都道府県単位・月次・最新月まで／"
+        "ただし対象は山形県かつ客室数200室以上の施設のみ）",
     )
     f.add_argument(
         "--fromto-top",
@@ -416,11 +755,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="census時、上位何件まで出すか（残りは「その他」に集約。0で全件）",
     )
     f.add_argument(
-        "--fromto-month", help="jinryu時のFrom-to対象年月（既定は取得できた最新月）"
+        "--fromto-month",
+        help="jinryu / lodging 時のFrom-to対象年月（例 2026-06。既定は取得できた最新月）",
     )
     f.add_argument("--dayflag", default="0", choices=["0", "1", "2"], help="0=全日 1=平日 2=休日")
     f.add_argument("--timezone", default="0", choices=["0", "1", "2"], help="0=終日 1=昼 2=夜")
     f.add_argument("--pref", default=areas.PREF_NAME, help="宿泊統計の対象都道府県")
+    f.add_argument(
+        "--lodging-source",
+        default="auto",
+        choices=["auto", "api", "files"],
+        help="宿泊者数の取得経路。api=e-Stat統計データベース（2014-2016のみ・要APIキー）／"
+        "files=ファイル配布のExcel（2015年〜最新月・鍵不要）／"
+        "auto=対象年がAPIの収録範囲なら api、外なら files（既定）",
+    )
+    f.add_argument(
+        "--lodging-area",
+        default="pref",
+        choices=["pref", "city"],
+        help=f"宿泊者数の地域粒度。pref={areas.PREF_NAME}（既定）／"
+        f"city={areas.TARGET_CITY_NAME}（速報値の市区町村別参考表。files経路のみ）",
+    )
+    f.add_argument(
+        "--lodging-table",
+        default="all",
+        choices=list(estat_lodging_files.PREF_TABLES),
+        help="files経路での集計対象。all=全施設（既定）／"
+        "over10=従業者数10人以上の施設（API経路と同じ系列・2025年までの表にのみ存在）",
+    )
+    f.add_argument(
+        "--use-browser",
+        action="store_true",
+        help="ファイル配布の取得をSelenium経由にする（通常不要。要 pip install -e \".[browser]\"）",
+    )
     f.add_argument("--app-id", help="e-Stat アプリケーションID（既定は環境変数 ESTAT_APP_ID）")
     f.set_defaults(func=cmd_fetch)
 
@@ -430,9 +797,17 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--file", help="入力CSVを明示指定する")
     m.set_defaults(func=cmd_manual)
 
-    e = sub.add_parser("estat-meta", help="宿泊旅行統計調査の分類コードを表示する")
+    e = sub.add_parser("estat-meta", help="宿泊旅行統計調査の分類コードを表示する（API経路）")
     e.add_argument("--app-id")
     e.set_defaults(func=cmd_estat_meta)
+
+    ef = sub.add_parser(
+        "estat-files", help="宿泊旅行統計調査のファイル配布の収録年月を一覧する（鍵不要）"
+    )
+    ef.add_argument(
+        "--use-browser", action="store_true", help="Selenium経由で取得する（通常不要）"
+    )
+    ef.set_defaults(func=cmd_estat_files)
 
     s = sub.add_parser("sample", help="列仕様どおりのサンプル（ダミー）CSVを生成する")
     common(s)
