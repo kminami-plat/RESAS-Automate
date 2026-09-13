@@ -17,6 +17,8 @@ from .sources import (
     estat_lodging_files,
     manual_import,
     mlit_jinryu,
+    resas_tourism_domestic,
+    resas_visa,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -97,7 +99,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     target = areas.resolve_areas(args.areas)
     out_dir = Path(args.out)
     cache_dir = Path(args.cache)
-    kinds = args.kind or ["stay", "fromto", "lodging"]
+    kinds = args.kind or list(writers.HEADERS)
     failures: list[str] = []
 
     def resolve_app_id(what: str) -> str:
@@ -247,6 +249,21 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             log.error("宿泊旅行統計調査の取得に失敗: %s", exc)
             failures.append("宿泊旅行統計調査")
+
+    if "spend-per-trip" in kinds:
+        try:
+            _fetch_spend_per_trip(args, out_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.error("RESAS 国内観光消費分析の取得に失敗: %s", exc)
+            failures.append("RESAS 国内観光消費分析")
+
+    cc_kinds = [k for k in ("cc-area", "cc-category", "consumption-domestic") if k in kinds]
+    if cc_kinds:
+        try:
+            _fetch_credit_card(args, out_dir, cc_kinds)
+        except Exception as exc:  # noqa: BLE001
+            log.error("RESAS クレジットカード消費額分析の取得に失敗: %s", exc)
+            failures.append("RESAS クレジットカード消費額分析")
 
     if failures:
         log.error("失敗した取得元: %s", " / ".join(failures))
@@ -602,6 +619,324 @@ def _fetch_fromto_lodging(
     )
 
 
+# ------------------------------------------------------ fetch: 国内観光消費分析
+
+
+def _fetch_spend_per_trip(args: argparse.Namespace, out_dir: Path) -> None:
+    """RESAS 国内観光消費分析のダウンロードCSVをそのまま書き出す。
+
+    他の種別と違って値は組み立て直さない。画面のダウンロードボタンが返すZIPを開き、
+    見出しを検証して UTF-8 BOM で置き直すだけ（配信元はShift_JIS）。
+    """
+    spec = writers.HEADERS["spend-per-trip"]
+    kw = dict(
+        expected_header=spec,
+        travel_type=args.spend_travel_type,
+        cost_type=args.spend_cost_type,
+    )
+    used_year: str | None = None
+    if args.spend_transition:
+        header, rows, prov = resas_tourism_domestic.fetch_spend_per_trip(
+            transition=args.spend_transition, **kw
+        )
+    else:
+        wanted = args.spend_year or args.year
+        header, rows, prov, used_year = resas_tourism_domestic.fetch_latest(
+            year=wanted, quarter=args.spend_period, **kw
+        )
+        if used_year == str(wanted):
+            used_year = None
+
+    path = writers.write("spend-per-trip", rows, out_dir, header=header)
+    writers.sidecar_note(
+        path,
+        [
+            "# resas-spend-per-trip.csv の出典",
+            "",
+            f"- 対象: 全国（{prov.travel_label}・{prov.cost_label}）",
+            f"- 対象期間: {prov.period_label}",
+            f"- 収録されている集計年: {'・'.join(prov.years)}",
+            f"- 出典: RESAS {prov.menu} {prov.url}",
+            f"- 元データ: {prov.provider}",
+            f"- 変換元ファイル: {prov.source_file}（ZIP内・Shift_JIS）",
+            f"- 行数: {prov.rows}",
+            "",
+            "## 取得経路",
+            "画面の「ダウンロード」ボタンと同じ",
+            "`https://api.resas.go.jp/v2/download/tourism/tourism-domestic/…` を叩いている。",
+            "鍵もログインも不要。応答はZIPで、中身はShift_JISのCSV1本。",
+            "**列は配信元のまま**で、UTF-8 BOM に置き直しているだけ（値は無加工）。",
+            "",
+            "## この数値が何であるか（重要）",
+            f"`{header[-1]}` は**全国値**である。",
+            f"{areas.TARGET_AREA_LABEL}や{areas.PREF_NAME}の内訳ではない。",
+            "この画面の都道府県別タブは訪問者数・消費単価・旅行消費額の3項目だけで、",
+            "属性別（年齢・男女・同行者・職業・宿泊施設・宿泊数）の単価は全国しか無い。",
+            "ダッシュボードでは参考値として扱うこと。",
+            "",
+            "旅行単価と購入者単価は分母が違う（`--spend-cost-type` で切替）:",
+            "",
+        ]
+        + [f"- {line}" for line in resas_tourism_domestic.OFFICIAL_NOTES]
+        + [
+            "",
+            "## 系列の注意",
+            f"収録範囲は {resas_tourism_domestic.YEARS[0]}〜{resas_tourism_domestic.YEARS[-1]}年"
+            "（2026-09時点）。範囲外の年を指定しても**エラーにならず見出しだけのCSVが返る**ため、",
+            "データ行が0件のときを未収録として扱っている。",
+            "",
+            "`--spend-transition year`（または `quarter`）を付けると、単年ではなく",
+            "収録全年の推移が1本で返る。年をまたいで比較するならそちら。",
+            "`--spend-travel-type day_trip_price` にすると最終列が `単価（日帰り）` に変わる",
+            "（ダッシュボードは `単価（宿泊中）` を読むので注意）。",
+        ]
+        + (
+            [
+                "",
+                f"※ {args.spend_year or args.year}年は未収録のため、{used_year}年を出力している。",
+            ]
+            if used_year
+            else []
+        ),
+    )
+
+
+# ------------------------------------------------- fetch: クレジットカード消費額分析
+
+
+# 大分類の正式名称 → ダッシュボードが使う短いラベル。
+# resas-consumption-domestic.csv だけこちらの表記で出す（列仕様の互換のため）。
+# 未知の区分名が増えたら正式名称のまま通す。
+_SHORT_CATEGORY: dict[str, str] = {
+    "宿泊費": "宿泊",
+    "飲食費": "飲食",
+    "交通費": "交通",
+    "娯楽等サービス費": "娯楽・体験",
+    "買物代": "土産・買物",
+    "その他": "その他",
+}
+
+
+def _fetch_credit_card(
+    args: argparse.Namespace, out_dir: Path, kinds: list[str]
+) -> None:
+    """現行RESASのクレジットカード消費額分析から3種のCSVを書き出す。
+
+    3つとも同じAPI・同じ期間指定で、切り口だけが違う:
+      cc-area             消費地（市区町村／都道府県）別の消費総額
+      cc-category         費目（大分類）別の消費総額
+      consumption-domestic 費目別・国内旅行者のみ（ラベルは短縮表記）
+    費目別は cc-category と consumption-domestic で同じAPIを叩くので、
+    条件が同じときは1回で済ませる。
+    """
+    pref_code = areas.PREF_CODE
+    city_code = areas.TARGET_CITY_CODE
+    year, quarters = resas_visa.resolve_year(
+        year=args.cc_year or args.year,
+        visitor=args.cc_visitor,
+        pref_code=pref_code,
+        city_code=city_code,
+    )
+    period = _resolve_cc_period(args.cc_period, quarters)
+    log.info(
+        "クレジットカード消費額: %s年 %s（%s・%s）",
+        year,
+        resas_visa.PERIODS[period],
+        resas_visa.VISITORS[args.cc_visitor],
+        areas.TARGET_AREA_LABEL,
+    )
+
+    common = dict(
+        year=year,
+        period=period,
+        pref_code=pref_code,
+        city_code=city_code,
+    )
+    # 費目別は2種類のCSVで使い回す（同じ問い合わせを2回投げない）
+    category_cache: dict[str, tuple[list[tuple[str, int]], resas_visa.Provenance]] = {}
+
+    def categories(visitor: str):
+        if visitor not in category_cache:
+            category_cache[visitor] = resas_visa.category_rows(
+                visitor=visitor, area_level="city", **common
+            )
+        return category_cache[visitor]
+
+    if "cc-area" in kinds:
+        rows, prov = resas_visa.place_rows(
+            visitor=args.cc_visitor, area_level=args.cc_area_level, **common
+        )
+        prov.area_label = (
+            f"{areas.PREF_NAME}内の市区町村"
+            if args.cc_area_level == "city"
+            else "47都道府県"
+        )
+        prov.covered_periods = quarters
+        shown = _top_with_other(rows, args.cc_area_top)
+        path = writers.write("cc-area", shown, out_dir)
+        writers.sidecar_note(
+            path,
+            _cc_note(
+                "resas-cc-area.csv",
+                prov,
+                [
+                    f"- 対象: {prov.area_label}（{areas.TARGET_AREA_LABEL}を含むランキング）",
+                    f"- 合計: {prov.total:,}{prov.unit}",
+                    "- 並び: 消費額の降順"
+                    + (
+                        f"、上位{args.cc_area_top}件＋その他"
+                        if args.cc_area_top
+                        else "、全件"
+                    ),
+                ],
+                [
+                    "## この列が何であるか",
+                    f"`消費地` は**決済が行われた市区町村**（{prov.area_label}）であり、",
+                    f"{areas.TARGET_AREA_LABEL}の中の地区名（温泉地・商店街など）ではない。",
+                    "Visaデータの最小単位が市区町村なので、市内の地区別内訳は取得できない。",
+                    "",
+                    f"`消費額` の単位は **{prov.unit}**（CSVの列名には単位が入らない）。",
+                ],
+            ),
+        )
+
+    if "cc-category" in kinds:
+        rows, prov = categories(args.cc_visitor)
+        prov.area_label = areas.TARGET_AREA_LABEL
+        prov.covered_periods = quarters
+        path = writers.write("cc-category", rows, out_dir)
+        writers.sidecar_note(
+            path,
+            _cc_note(
+                "resas-cc-category.csv",
+                prov,
+                [
+                    f"- 対象: {prov.area_label}",
+                    f"- 合計: {prov.total:,}{prov.unit}",
+                    "- 区分: 費目の大分類（区分名はAPIの応答をそのまま使う）",
+                ],
+                [
+                    "## この列が何であるか",
+                    f"`消費額` の単位は **{prov.unit}**（CSVの列名には単位が入らない）。",
+                    "",
+                    "旅行者区分は `--cc-visitor` で切り替える"
+                    f"（現在: {prov.visitor_label}）。",
+                    "`--cc-visitor domestic` のときは resas-consumption-domestic.csv と",
+                    "同じ値になる（あちらは費目のラベルが短縮表記）。",
+                ],
+            ),
+        )
+
+    if "consumption-domestic" in kinds:
+        rows, prov = categories("domestic")
+        prov.area_label = areas.TARGET_AREA_LABEL
+        prov.covered_periods = quarters
+        renamed = [(_SHORT_CATEGORY.get(name, name), value) for name, value in rows]
+        path = writers.write("consumption-domestic", renamed, out_dir)
+        writers.sidecar_note(
+            path,
+            _cc_note(
+                "resas-consumption-domestic.csv",
+                prov,
+                [
+                    f"- 対象: {prov.area_label}",
+                    f"- 合計: {prov.total:,}{prov.unit}",
+                    "- 区分: 費目の大分類（国内旅行者のみ）",
+                ],
+                [
+                    "## この列が何であるか",
+                    f"`金額` の単位は **{prov.unit}**（CSVの列名には単位が入らない）。",
+                    "",
+                    "費目のラベルはダッシュボードの表記に合わせて短縮している"
+                    "（RESASの正式名称 → このCSVの表記）:",
+                    "",
+                ]
+                + [f"- {k} → {v}" for k, v in _SHORT_CATEGORY.items() if k != v]
+                + [
+                    "",
+                    "旅行者区分は**国内旅行に固定**（ファイル名の domestic がそれ）。",
+                    "訪日旅行の同じ表は `--kind cc-category --cc-visitor overseas` で出せる。",
+                ],
+            ),
+        )
+
+
+def _resolve_cc_period(spec: str, quarters: list[str]) -> str:
+    """`--cc-period auto` を実際の期間に解決する。
+
+    通年（all）は**収録済みの四半期だけを足した値**になるので、
+    4四半期そろっていない年で all を既定にすると「1年分に見える1四半期分」が出る。
+    それを避けるため、揃っていない年では収録最新の四半期を選ぶ。
+    """
+    if spec != "auto":
+        return spec
+    if len(quarters) == len(resas_visa.QUARTERS):
+        return "all"
+    latest = quarters[-1]
+    log.warning(
+        "この年は%sまでしか収録されていないため、通年ではなく%sを出力します",
+        resas_visa.QUARTERS[latest],
+        resas_visa.QUARTERS[latest],
+    )
+    return latest
+
+
+def _cc_note(
+    filename: str,
+    prov: "resas_visa.Provenance",
+    facts: list[str],
+    detail: list[str],
+) -> list[str]:
+    """クレジットカード消費額分析のsidecarを組み立てる（3種で共通の部分をまとめる）。"""
+    covered = "・".join(resas_visa.QUARTERS[q] for q in prov.covered_periods)
+    rounding: list[str] = []
+    if prov.reported_total is not None and prov.reported_total != prov.total:
+        rounding = [
+            f"- ※ RESAS画面の表示総額は {prov.reported_total:,}{prov.unit}。"
+            f"CSVは行ごとに整数へ丸めているため和が {prov.total:,}{prov.unit} になる。",
+        ]
+    return (
+        [
+            f"# {filename} の出典",
+            "",
+        ]
+        + facts
+        + [
+            f"- 対象期間: {prov.year}年 {prov.period_label}",
+            f"- 旅行者区分: {prov.visitor_label}",
+            f"- 指標: {prov.calc_label}（単位 {prov.unit}）",
+            f"- 出典: RESAS {prov.menu} {prov.url}",
+            f"- データ提供: {resas_visa.PROVIDER}",
+            f"- {prov.year}年の収録: {covered or '（四半期の判定なし）'}",
+        ]
+        + rounding
+        + [
+            "",
+            "## 取得経路",
+            "旧RESAS-API（opendata.resas-portal.go.jp）は2025-03-24に終了しているが、",
+            "2026-06-18のRESAS刷新で追加されたこのメニューは画面が",
+            "`https://api.resas.go.jp/v2/tourism/visa-spending/…` のJSONを直接叩いている。",
+            "鍵もログインも不要なので、そのまま取得している（Selenium不要）。",
+            "**この3種だけは代替データではなく現行RESASそのものの値**である。",
+            "",
+        ]
+        + detail
+        + [
+            "",
+            "## データの性質（配信元の注記）",
+            "",
+        ]
+        + [f"- {line}" for line in resas_visa.OFFICIAL_NOTES]
+        + [
+            "",
+            "## 系列の注意",
+            "四半期ごとに更新されるため、実行するたびに最新期が増える。",
+            "推計値であり、同じ期間でも改訂されうる。",
+            "JCB／ナウキャストを使っていた旧RESASの消費マップとは別系列で、値は接続しない。",
+        ]
+    )
+
+
 def _top_with_other(rows: list[tuple[str, int]], top: int) -> list[tuple[str, int]]:
     """上位 top 件＋残りを「その他」に集約する。top=0 なら全件。
 
@@ -667,6 +1002,19 @@ def cmd_estat_files(args: argparse.Namespace) -> int:
     return 0
 
 
+# ----------------------------------------------------------------- resas-visa-meta
+
+
+def cmd_resas_visa_meta(args: argparse.Namespace) -> int:
+    """クレジットカード消費額分析に何年分あるかを見る。四半期更新なので都度変わる。"""
+    print(
+        resas_visa.describe(
+            pref_code=areas.PREF_CODE, city_code=areas.TARGET_CITY_CODE
+        )
+    )
+    return 0
+
+
 # -------------------------------------------------------------------------- sample
 
 
@@ -674,6 +1022,13 @@ SAMPLE = {
     "stay": [("2025-07", "米沢市", 58500), ("2025-08", "米沢市", 61000)],
     "fromto": [("山形市", 9800), ("南陽市", 4200), ("福島市", 3100)],
     "lodging": [("2025-07", 47000, 1500), ("2025-08", 52000, 1800)],
+    "cc-area": [("山形県山形市", 351525), ("山形県米沢市", 94090), ("その他", 260000)],
+    "cc-category": [("宿泊費", 14090), ("飲食費", 16943), ("買物代", 42338)],
+    "consumption-domestic": [("宿泊", 14090), ("飲食", 16943), ("土産・買物", 42338)],
+    "spend-per-trip": [
+        ("2025", "すべての期間", "A", "年齢", "A01", "9歳以下", 48670),
+        ("2025", "すべての期間", "B", "男女", "B01", "男性", 65480),
+    ],
 }
 
 
@@ -707,7 +1062,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true", help="詳細ログ")
     sub = p.add_subparsers(dest="command", required=True)
 
-    def common(sp: argparse.ArgumentParser) -> None:
+    def common(sp: argparse.ArgumentParser, kinds: list[str]) -> None:
         sp.add_argument(
             "--out",
             default=str(DEFAULT_OUT),
@@ -716,12 +1071,14 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--kind",
             action="append",
-            choices=["stay", "fromto", "lodging"],
+            choices=kinds,
             help="出力する種別（複数指定可・既定は全部）",
         )
 
+    all_kinds = list(writers.HEADERS)
+
     f = sub.add_parser("fetch", help="オープンデータから自動取得する")
-    common(f)
+    common(f, all_kinds)
     f.add_argument("--cache", default=str(DEFAULT_CACHE), help="ダウンロードキャッシュ")
     f.add_argument(
         "--areas",
@@ -788,11 +1145,72 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="ファイル配布の取得をSelenium経由にする（通常不要。要 pip install -e \".[browser]\"）",
     )
+    f.add_argument(
+        "--cc-year",
+        type=int,
+        help="クレジットカード消費額の対象年（既定は --year。未収録なら収録最新年に遡る）",
+    )
+    f.add_argument(
+        "--cc-period",
+        default="auto",
+        choices=["auto"] + list(resas_visa.PERIODS),
+        help="クレジットカード消費額の対象期間。auto=4四半期そろっていれば通年、"
+        "そうでなければ収録最新の四半期（既定）／all=通年／quarter1-4／1-12（月）",
+    )
+    f.add_argument(
+        "--cc-visitor",
+        default="domestic",
+        choices=list(resas_visa.VISITORS),
+        help="旅行者区分。domestic=国内旅行（既定）／overseas=訪日旅行。"
+        "consumption-domestic は常に国内旅行",
+    )
+    f.add_argument(
+        "--cc-area-level",
+        default="city",
+        choices=["city", "pref"],
+        help=f"消費地の粒度。city={areas.PREF_NAME}内の市区町村（既定）／pref=47都道府県",
+    )
+    f.add_argument(
+        "--cc-area-top",
+        type=int,
+        default=0,
+        help="消費地を上位何件まで出すか（残りは「その他」に集約。0で全件・既定）",
+    )
+    f.add_argument(
+        "--spend-year",
+        type=int,
+        help="国内観光消費分析の対象年（既定は --year。未収録なら収録最新年に遡る）",
+    )
+    f.add_argument(
+        "--spend-period",
+        default="year",
+        choices=list(resas_tourism_domestic.QUARTERS),
+        help="国内観光消費分析の対象期間。year=すべての期間（既定）／1-3・4-6・7-9・10-12",
+    )
+    f.add_argument(
+        "--spend-travel-type",
+        default="during_day_price",
+        choices=list(resas_tourism_domestic.TRAVEL_TYPES),
+        help="during_day_price=宿泊旅行（既定・最終列は 単価（宿泊中））／"
+        "day_trip_price=日帰り旅行（最終列は 単価（日帰り））",
+    )
+    f.add_argument(
+        "--spend-cost-type",
+        default="0",
+        choices=list(resas_tourism_domestic.COST_TYPES),
+        help="0=一人一回当たり旅行単価（既定・属性別）／1=一人一回当たり購入者単価（費目別）",
+    )
+    f.add_argument(
+        "--spend-transition",
+        choices=list(resas_tourism_domestic.FREQUENCIES),
+        help="単年ではなく収録全年の推移を出す。year=年次ごと／quarter=四半期ごと"
+        "（指定すると --spend-year / --spend-period は使われない）",
+    )
     f.add_argument("--app-id", help="e-Stat アプリケーションID（既定は環境変数 ESTAT_APP_ID）")
     f.set_defaults(func=cmd_fetch)
 
     m = sub.add_parser("manual", help="手動DLしたCSV（input/）を所定の列仕様に変換する")
-    common(m)
+    common(m, list(manual_import.IMPORTERS))
     m.add_argument("--input", default=str(DEFAULT_INPUT), help="入力CSVのディレクトリ")
     m.add_argument("--file", help="入力CSVを明示指定する")
     m.set_defaults(func=cmd_manual)
@@ -809,8 +1227,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ef.set_defaults(func=cmd_estat_files)
 
+    rv = sub.add_parser(
+        "resas-visa-meta",
+        help="RESAS クレジットカード消費額分析の収録年・四半期を一覧する（鍵不要）",
+    )
+    rv.set_defaults(func=cmd_resas_visa_meta)
+
     s = sub.add_parser("sample", help="列仕様どおりのサンプル（ダミー）CSVを生成する")
-    common(s)
+    common(s, all_kinds)
     s.set_defaults(func=cmd_sample)
 
     return p

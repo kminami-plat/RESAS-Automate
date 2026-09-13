@@ -13,21 +13,56 @@ HEADERS: dict[str, list[str]] = {
     "stay": ["年月", "エリア", "滞在人口"],
     "fromto": ["流入元", "滞在人口"],
     "lodging": ["年月", "宿泊者数", "うち外国人"],
+    "cc-area": ["消費地", "消費額"],
+    "cc-category": ["費目", "消費額"],
+    "consumption-domestic": ["費目", "金額"],
+    # 配信元（RESAS 国内観光消費分析）のCSVをそのまま通す種別。
+    # 最終列だけは旅行種類で変わる（単価（宿泊中）/ 単価（日帰り））ので、
+    # sources/resas_tourism_domestic.py が実際の見出しを write() に渡す。
+    "spend-per-trip": [
+        "集計年",
+        "集計時期",
+        "大分類コード",
+        "大分類名",
+        "中分類コード",
+        "中分類名",
+        "単価（宿泊中）",
+    ],
 }
 
 FILENAMES: dict[str, str] = {
     "stay": "resas-stay.csv",
     "fromto": "resas-fromto.csv",
     "lodging": "resas-lodging.csv",
+    "cc-area": "resas-cc-area.csv",
+    "cc-category": "resas-cc-category.csv",
+    "consumption-domestic": "resas-consumption-domestic.csv",
+    "spend-per-trip": "resas-spend-per-trip.csv",
 }
 
 
-def write(kind: str, rows: Iterable[Sequence[object]], out_dir: Path) -> Path:
-    """kind（stay/fromto/lodging）に応じた列名でCSVを出力する。
+def write(
+    kind: str,
+    rows: Iterable[Sequence[object]],
+    out_dir: Path,
+    *,
+    header: Sequence[str] | None = None,
+) -> Path:
+    """kind に応じた列名でCSVを出力する（対応する kind は HEADERS を参照）。
+
+    ``header`` を渡せるのは**配信元のCSVをそのまま通す種別だけ**で、
+    列の一部が取得条件で変わるものに限る（`spend-per-trip` の最終列）。
+    それ以外は HEADERS が単一の情報源なので指定しないこと。
+    列数が HEADERS と違えば弾く。
 
     Excelでの文字化けを避けるため UTF-8 BOM 付きで書き出す。
     """
-    header = HEADERS[kind]
+    spec = HEADERS[kind]
+    header = list(header) if header is not None else spec
+    if len(header) != len(spec):
+        raise ValueError(
+            f"{kind}: 見出しの列数が{len(header)}、期待は{len(spec)} -> {header!r}"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / FILENAMES[kind]
     rows = list(rows)

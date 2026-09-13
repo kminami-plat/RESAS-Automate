@@ -1,7 +1,10 @@
 # RESAS-Automate
 
-**山形県米沢市**の **滞在人口・From-to（流入元）・宿泊者数** を公的オープンデータから取得し、
-決められた列仕様のCSV（`resas-stay.csv` / `resas-fromto.csv` / `resas-lodging.csv`）を
+**山形県米沢市**の **滞在人口・From-to（流入元）・宿泊者数・クレジットカード消費額・旅行単価** を
+公的オープンデータから取得し、決められた列仕様のCSV
+（`resas-stay.csv` / `resas-fromto.csv` / `resas-lodging.csv` /
+`resas-cc-area.csv` / `resas-cc-category.csv` / `resas-consumption-domestic.csv` /
+`resas-spend-per-trip.csv`）を
 `data/raw/resas/` に生成する。
 
 - **対象地域は山形県米沢市で固定**（市区町村コード `06202`）。
@@ -14,13 +17,17 @@ openpyxl も pandas も要らない。Selenium だけは任意依存だが、通
 
 ---
 
-## 重要：RESAS-API は終了している
+## 重要：旧RESAS-API は終了している（が、新メニューは直接取れる）
 
-**RESAS-API は 2025年3月24日をもって提供を終了した**（アカウントも自動削除）。
-現行の [RESAS](https://resas.go.jp/) は Next.js の画面アプリで、公開APIもサーバサイドHTMLも持たない。
-そのため「RESASから自動でAPI取得」は現在成立しない。
+**旧RESAS-API（`opendata.resas-portal.go.jp`）は 2025年3月24日をもって提供を終了した**
+（アカウントも自動削除）。滞在人口・From-to・宿泊者数を旧APIから取る道はもう無い。
+本ツールはこの3種について **一次データの配信元から直接取得**し、RESASと同じ指標を組み立てる。
 
-本ツールは代わりに **一次データの配信元から直接取得**し、RESASと同じ指標を組み立てる。
+一方、**2026年6月18日のRESAS刷新で「クレジットカード消費地分析／消費額分析」が新設**され、
+この画面は `https://api.resas.go.jp/v2/` のJSONを鍵なしで叩いている。
+**クレジットカード消費額の3種（`resas-cc-*.csv` / `resas-consumption-domestic.csv`）だけは
+代替データではなく現行RESASそのものの値**である。
+
 RESAS画面からのCSV手動ダウンロードにも対応する（`manual` サブコマンド）。
 
 ## 取得元と実際に取れるもの
@@ -34,6 +41,10 @@ RESAS画面からのCSV手動ダウンロードにも対応する（`manual` サ
 | `resas-lodging.csv` | 観光庁 宿泊旅行統計調査（[e-Stat ファイル配布](https://www.e-stat.go.jp/stat-search/files?toukei=00601020)のExcel）※既定 | ✅ 鍵不要 | **2015年〜最新の第2次速報月** | **都道府県**・月次 |
 | 〃（`--lodging-area city`） | 上の速報値 参考第6表・第8表 | ✅ 鍵不要 | 同上（掲載月のみ） | **米沢市**・月次 |
 | 〃（`--lodging-source api`） | 宿泊旅行統計調査 参考第３表（[e-Stat API](https://www.e-stat.go.jp/api/)） | ✅ 要APIキー（無料） | **2014-01〜2016-12** | 都道府県・月次 |
+| `resas-cc-area.csv` | [RESAS クレジットカード消費額分析](https://resas.go.jp/tourism-credit-consumption-amount)（Visa加工データ） | ✅ 鍵不要 | **2025年〜最新四半期** | 市区町村・四半期／月次 |
+| `resas-cc-category.csv` | 〃（費目大分類別） | ✅ 鍵不要 | 同上 | **米沢市**・四半期／月次 |
+| `resas-consumption-domestic.csv` | 〃（費目大分類別・国内旅行のみ） | ✅ 鍵不要 | 同上 | **米沢市**・四半期／月次 |
+| `resas-spend-per-trip.csv` | [RESAS 国内観光消費分析](https://resas.go.jp/tourism-domestic)（観光庁 旅行・観光消費動向調査） | ✅ 鍵不要 | **2023〜2025年** | **全国**・年／四半期 |
 
 ### 制約（重要）
 
@@ -44,8 +55,10 @@ RESAS画面からのCSV手動ダウンロードにも対応する（`manual` サ
    月次の滞在人口を自治体名単位で流入元まで分解した公的オープンデータは存在しない。
    - 人流オープンデータ（`--fromto-source jinryu`）の `from_area` 列は
      `0=同市区町村 / 1=同都道府県 / 2=同地方 / 3=それ以外` の4区分どまり。
-   - 旧RESASの「From-to分析（滞在人口）」は提供終了。**現行RESASにFrom-to分析機能は無い**
-     （2026-09時点でフロントのJSバンドルを全チャンク走査して確認済み）。
+   - 旧RESASの「From-to分析（滞在人口）」は提供終了。**現行RESASにFrom-to分析メニューは無い**
+     （2026-09時点で分析メニュー定義を確認）。ただし新設の「クレジットカード消費地分析」に
+     居住地別の入込人数（自治体名単位・2025年〜・四半期更新）があり、乗り換え候補になる。
+     詳細は `CLAUDE.md`。
    - そのため既定（`--fromto-source census`）では国勢調査 従業地・通学地集計を使い、
      **2020年時点の通勤・通学者数**を自治体名つき・降順で出力する。
      観光目的の人流ではない点に注意（出力される `.md` にも毎回明記される）。
@@ -64,7 +77,7 @@ RESAS画面からのCSV手動ダウンロードにも対応する（`manual` サ
    （抜けは `resas-lodging.md` の「欠測」に記録される）。
    年確定値には市区町村別の表が無いので、この値が確報に置き換わることはない。
 
-5. **From-toだけは最新化できない**。国勢調査の従業地・通学地集計は令和2年（2020年）が最新で、
+5. **From-toは公的統計側では最新化できない**。国勢調査の従業地・通学地集計は令和2年（2020年）が最新で、
    令和7年調査ぶんは未公表（前回は調査の約2年後）。人流オープンデータも2021-12で凍結
    （配信元リソースの最終更新は2022-01）。
 
@@ -82,6 +95,20 @@ RESAS画面からのCSV手動ダウンロードにも対応する（`manual` サ
 
    2026-06 の山形県は総数12,098人泊で、同月の県全体（383,880人泊）の3.2%にすぎない。
    ダッシュボードで使う場合は「山形県の大型施設に泊まった人の居住地」と明記すること。
+
+   なお新設の RESAS「クレジットカード消費地分析」には**米沢市への入込人数の居住地別内訳**
+   （843市区町村・2025年〜・四半期更新）がある。乗り換え候補だが未実装
+   （Visa会員の決済からの**推定居住地**で、通勤・通学者数とも滞在人口とも別物）。
+
+6. **クレジットカード消費額はVisaの推計値で、2025年より前は無い**。
+   - データ提供は **Visa Consulting & Analytics**。JCB／ナウキャストだった
+     旧RESASの消費マップとは**別系列で、値は接続しない**。
+   - 収録は**2025年〜最新四半期**（2026-09時点で2026年 第1四半期まで）。2024年以前は空。
+   - **消費地の最小単位は市区町村**。「小野川温泉」「上杉神社周辺」のような
+     市内の地区別内訳は存在しない。
+   - **単位は市区町村・都道府県なら万円、全国なら百万円**。CSVの列名に単位は入らないので
+     同名の `.md` を見ること。
+   - 対面決済のみが対象で、VISAシェアを補正した推計値。同じ期間でも改訂されうる。
 
 6. **宿泊者数には系列が2本ある**。`--lodging-table all`（既定・全施設）と
    `over10`（従業者数10人以上の施設＝API経路と同じ系列）は同じ月でも値が違う。
@@ -144,7 +171,7 @@ ESTAT_APP_ID=xxxx resas-automate fetch --kind lodging
 ### 自動取得
 
 ```bash
-# 3種類まとめて（米沢市・対象年の取れる範囲を昇順で）
+# 7種類まとめて（米沢市・対象年の取れる範囲を昇順で）
 resas-automate fetch
 
 # 年を明示する
@@ -184,7 +211,40 @@ resas-automate fetch --kind lodging --lodging-source api --year 2016
 
 # ファイル配布側に何年分あるか見る（鍵不要・ダウンロードしない）
 resas-automate estat-files
+
+# ── クレジットカード消費額（現行RESASの内部API・鍵不要） ──
+# 収録されている年・四半期を確認する
+resas-automate resas-visa-meta
+
+# 2025年通年（4四半期そろっている年は --cc-period auto でも通年になる）
+resas-automate fetch --kind cc-category --cc-year 2025 --cc-period all
+
+# 訪日旅行の費目別
+resas-automate fetch --kind cc-category --cc-year 2025 --cc-period all --cc-visitor overseas
+
+# 特定の月だけ
+resas-automate fetch --kind consumption-domestic --cc-year 2025 --cc-period 8
+
+# 消費地を47都道府県ランキングにして上位10件＋その他にする
+resas-automate fetch --kind cc-area --cc-area-level pref --cc-area-top 10
+
+# ── 旅行単価（国内観光消費分析・鍵不要） ──
+# 既定：2025年・すべての期間・宿泊旅行・一人一回当たり旅行単価（全国）
+resas-automate fetch --kind spend-per-trip
+
+# 収録全年（2023-2025）の推移を1本で
+resas-automate fetch --kind spend-per-trip --spend-transition year
+
+# 費目別の購入者単価
+resas-automate fetch --kind spend-per-trip --spend-cost-type 1
+
+# 日帰り旅行・特定四半期（最終列が 単価（日帰り） に変わる点に注意）
+resas-automate fetch --kind spend-per-trip --spend-travel-type day_trip_price --spend-period 4-6
 ```
+
+クレジットカード消費額は**四半期ごとに更新**される。`--cc-period auto`（既定）は
+4四半期そろっている年なら通年、欠けている年なら**収録最新の四半期**を選ぶ
+（`all` は収録済みの四半期を足すだけなので、そのままだと1四半期分が1年分に見えてしまう）。
 
 `--lodging-source` は既定 `auto`（対象年がAPIの収録範囲2014-2016なら `api`、
 外なら `files`）。`files` はAPIキー不要で、Excelは `cache/` に残るので2回目以降は速い。
@@ -196,7 +256,7 @@ resas-automate estat-files
 
 | オプション | 既定 | 説明 |
 |---|---|---|
-| `--kind {stay,fromto,lodging}` | 全部 | 複数指定可 |
+| `--kind {stay,fromto,lodging,cc-area,cc-category,consumption-domestic,spend-per-trip}` | 全部 | 複数指定可 |
 | `--year 2021` | 今年 | その年の収録済み月を昇順で取得。未収録なら収録最新年に自動切替 |
 | `--months 2021-01:2021-12` | （`--year` を使う） | 年指定より優先。`2021-07,2021-08` のような列挙も可 |
 | `--areas {yonezawa,okitama}` | `yonezawa` | 米沢市固定。`okitama` は置賜8市町の参考用 |
@@ -210,6 +270,16 @@ resas-automate estat-files
 | `--lodging-area {pref,city}` | `pref` | `city` は米沢市（`files` 経路のみ） |
 | `--lodging-table {all,over10}` | `all` | `files`経路の集計対象。`over10`=従業者数10人以上（API経路と同系列） |
 | `--use-browser` | off | 配布ファイルの取得をSelenium経由にする（通常不要） |
+| `--cc-year 2025` | `--year` と同じ | クレカ消費額の対象年。未収録なら収録最新年に自動で遡る |
+| `--cc-period {auto,all,quarter1..4,1..12}` | `auto` | `auto`=4四半期そろっていれば通年、欠けていれば収録最新の四半期 |
+| `--cc-visitor {domestic,overseas}` | `domestic` | 国内旅行／訪日旅行。`consumption-domestic` は常に国内旅行 |
+| `--cc-area-level {city,pref}` | `city` | 消費地の粒度。`city`=山形県内の市区町村／`pref`=47都道府県 |
+| `--cc-area-top N` | `0`（全件） | 消費地の上位件数。残りは「その他」に集約 |
+| `--spend-year 2025` | `--year` と同じ | 旅行単価の対象年（2023-2025）。未収録なら収録最新年に自動で遡る |
+| `--spend-period {year,1-3,4-6,7-9,10-12}` | `year` | `year`=すべての期間 |
+| `--spend-travel-type {during_day_price,day_trip_price}` | `during_day_price` | 宿泊旅行／日帰り旅行。最終列の名前が変わる |
+| `--spend-cost-type {0,1}` | `0` | `0`=一人一回当たり旅行単価（属性別）／`1`=一人一回当たり購入者単価（費目別） |
+| `--spend-transition {year,quarter}` | off | 単年でなく収録全年の推移を出す |
 | `--out DIR` | `data/raw/resas` | CSV出力先（同名の `.md` も同じ場所） |
 
 ### 手元のCSV/Excelを変換する（RESAS画面の出力・県や市の観光統計など）
@@ -248,10 +318,25 @@ resas-automate sample --kind lodging
 いずれも `data/raw/resas/` に出力される（`--out` で変更可）。
 
 ```
-data/raw/resas/resas-stay.csv     年月,エリア,滞在人口        例) 2021-08,米沢市,88834
-data/raw/resas/resas-fromto.csv   流入元,滞在人口             例) 高畠町,3411
-data/raw/resas/resas-lodging.csv  年月,宿泊者数,うち外国人    例) 2026-06,383880,12660
+data/raw/resas/resas-stay.csv       年月,エリア,滞在人口       例) 2021-08,米沢市,88834
+data/raw/resas/resas-fromto.csv     流入元,滞在人口            例) 高畠町,3411
+data/raw/resas/resas-lodging.csv    年月,宿泊者数,うち外国人   例) 2026-06,383880,12660
+data/raw/resas/resas-cc-area.csv    消費地,消費額              例) 山形県米沢市,94090
+data/raw/resas/resas-cc-category.csv          費目,消費額      例) 買物代,42338
+data/raw/resas/resas-consumption-domestic.csv 費目,金額        例) 土産・買物,42338
+data/raw/resas/resas-spend-per-trip.csv  集計年,集計時期,大分類コード,大分類名,
+                                         中分類コード,中分類名,単価（宿泊中）
+                                         例) 2025,すべての期間,A,年齢,A01,9歳以下,48670
 ```
+
+`resas-spend-per-trip.csv` だけは**配信元（RESAS）のCSVをそのまま通す**種別で、
+列はRESASのもの。値は無加工で、Shift_JIS から UTF-8 BOM に置き直しているだけ。
+最終列は旅行種類で `単価（宿泊中）` / `単価（日帰り）` と変わる。**全国値**であって
+米沢市や山形県の内訳ではない（属性別の単価は都道府県別が公表されていない）。
+
+クレジットカード消費額の3種は**年月列を持たないため値の降順**（対象期間は `.md` に記載）。
+**単位は市区町村・都道府県なら「万円」、全国なら「百万円」**で、CSVの列名には単位が入らない。
+必ず同名の `.md` を見ること。
 
 年月を持つ `resas-stay.csv` / `resas-lodging.csv` は**年月の昇順**。
 `resas-fromto.csv` は年月列を持たないため**値の降順**で並べ、末尾に「その他」を置く
@@ -265,7 +350,8 @@ Excel でそのまま開けるよう UTF-8 BOM 付きで書き出す。
 
 ```
 src/resas_automate/
-├── cli.py                     サブコマンド（fetch / manual / estat-meta / estat-files / sample）
+├── cli.py                     サブコマンド（fetch / manual / estat-meta / estat-files /
+│                               resas-visa-meta / sample）
 ├── areas.py                   対象市区町村（米沢市 06202 固定）・コードラベル定義
 ├── http.py                    取得・リトライ・レート制限・キャッシュ
 ├── xlsx.py                    xlsx読み取り（標準ライブラリのみ・openpyxl不要）
@@ -276,13 +362,20 @@ src/resas_automate/
     ├── estat_lodging.py       宿泊旅行統計調査（e-Stat API・2014-2016）
     ├── estat_files.py         e-Stat ファイル配布の一覧・ダウンロード
     ├── estat_lodging_files.py 配布Excel → 宿泊者数の行（都道府県／市区町村）
+    ├── resas_api.py           現行RESASの内部APIへの共通アクセス（403回避ヘッダ・ZIP/JSONの剥がし）
+    ├── resas_visa.py          クレジットカード消費額分析（Visa加工データ）
+    ├── resas_tourism_domestic.py 国内観光消費分析（旅行単価。配信元CSVの通し）
     ├── browser.py             Selenium フォールバック（任意依存・通常は未使用）
     └── manual_import.py       手動DL CSV/Excelの正規化
 
 data/raw/resas/                生成物の置き場（--out の既定）
 ├── resas-stay.csv / .md
 ├── resas-fromto.csv / .md
-└── resas-lodging.csv / .md
+├── resas-lodging.csv / .md
+├── resas-cc-area.csv / .md
+├── resas-cc-category.csv / .md
+├── resas-consumption-domestic.csv / .md
+└── resas-spend-per-trip.csv / .md
 input/                         manual サブコマンドが読む手動DLファイル
 cache/                         配信元ZIP・Excelのキャッシュ
 ```
@@ -313,3 +406,6 @@ resas-automate fetch --kind lodging --use-browser
 - 国土交通省「全国の人流オープンデータ（1kmメッシュ、市区町村単位発地別）」（G空間情報センター）
 - 観光庁「宿泊旅行統計調査」（e-Stat 政府統計の総合窓口）
 - 総務省統計局「令和2年国勢調査 従業地・通学地集計」（e-Stat 政府統計の総合窓口）
+- 経済産業省・内閣官房「地域経済分析システム（RESAS）クレジットカード消費額分析」
+  （データ提供: Visa Consulting & Analytics により加工・分析されたデータ）
+- 観光庁「旅行・観光消費動向調査」（地域経済分析システム（RESAS）国内観光消費分析）

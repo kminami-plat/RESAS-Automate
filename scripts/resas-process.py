@@ -88,8 +88,9 @@ if sp:
         "min": min(allv) if allv else 0, "max": max(allv) if allv else 0,
         "groups": [groups[c] for c in order],
     })
-else:
-    # 実CSV未配置ならサンプル（費目別）を維持
+# 費目別（クレジットカード消費額分析・国内旅行／米沢市）。
+# spend-per-trip.csv とは別データなので、両方あれば両方書く（以前は else で排他だった）。
+if read_csv("resas-consumption-domestic.csv"):
     write("consumption-domestic.json", {"category": cat_csv("resas-consumption-domestic.csv", "費目", "金額")["items"]})
 # ※ consumption-inbound.json は RESAS『クレジットカード分析（消費額）』訪日旅行の
 #   画面キャプチャから手作業で転記した実データ（費目別総額・市町村/国別ランキング・時間帯/平日土日）。

@@ -29,8 +29,19 @@ def _throttle() -> None:
     _last_request = time.monotonic()
 
 
-def fetch(url: str, *, retries: int = 3, timeout: int = 120) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def fetch(
+    url: str,
+    *,
+    retries: int = 3,
+    timeout: int = 120,
+    headers: dict[str, str] | None = None,
+) -> bytes:
+    """URLを取得する。``headers`` はUser-Agentを含め既定のヘッダを上書きする。
+
+    ``headers`` が要るのは api.resas.go.jp だけ。ここはブラウザのUAと
+    Origin/Referer が揃っていないと403を返す（sources/resas_visa.py 参照）。
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
     last: Exception | None = None
     for attempt in range(1, retries + 1):
         _throttle()
@@ -68,13 +79,19 @@ def fetch_cached(
     return path
 
 
-def fetch_json(url: str, *, data: bytes | None = None) -> dict:
+def fetch_json(
+    url: str, *, data: bytes | None = None, headers: dict[str, str] | None = None
+) -> dict:
     if data is None:
-        return json.loads(fetch(url))
+        return json.loads(fetch(url, headers=headers))
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
+        headers={
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            **(headers or {}),
+        },
     )
     _throttle()
     with urllib.request.urlopen(req, timeout=120) as resp:

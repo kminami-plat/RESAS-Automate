@@ -34,6 +34,9 @@ COLUMN_HINTS: dict[str, tuple[str, ...]] = {
     "from": ("流入元", "発地", "居住地", "出発地", "From"),
     "lodging": ("延べ宿泊者数", "宿泊者数", "延べ宿泊"),
     "foreign": ("外国人",),
+    "place": ("消費地", "市区町村", "地域", "エリア"),
+    "category": ("費目", "分類", "品目", "カテゴリ"),
+    "amount": ("消費額", "消費総額", "金額", "消費単価"),
 }
 
 _NUM_RE = re.compile(r"-?[\d,]+(?:\.\d+)?")
@@ -199,7 +202,42 @@ def import_lodging(path: Path) -> list[tuple[str, int, int]]:
     return sorted(out)
 
 
-IMPORTERS = {"stay": import_stay, "fromto": import_fromto, "lodging": import_lodging}
+def _import_pairs(path: Path, name_key: str) -> list[tuple[str, int]]:
+    """「名称,値」の2列CSVを降順で取り込む（クレジットカード消費額分析の3種）。
+
+    RESASのこのメニューに画面からのCSVダウンロードは無いので、
+    この経路は表計算で作った手持ちの表を取り込むとき用。
+    通常は `fetch --kind cc-area` などでAPIから直接取れる。
+    """
+    rows = _rows(path)
+    hi, cols = _find_header(rows, (name_key, "amount"))
+    out: list[tuple[str, int]] = []
+    for row in rows[hi + 1 :]:
+        if max(cols.values()) >= len(row):
+            continue
+        name = row[cols[name_key]].strip()
+        value = _num(row[cols["amount"]])
+        if name and value is not None:
+            out.append((name, value))
+    return sorted(out, key=lambda kv: kv[1], reverse=True)
+
+
+def import_cc_area(path: Path) -> list[tuple[str, int]]:
+    return _import_pairs(path, "place")
+
+
+def import_cc_category(path: Path) -> list[tuple[str, int]]:
+    return _import_pairs(path, "category")
+
+
+IMPORTERS = {
+    "stay": import_stay,
+    "fromto": import_fromto,
+    "lodging": import_lodging,
+    "cc-area": import_cc_area,
+    "cc-category": import_cc_category,
+    "consumption-domestic": import_cc_category,
+}
 
 
 INPUT_SUFFIXES = ("*.csv", "*.xlsx", "*.xlsm")

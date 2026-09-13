@@ -6,8 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 何をするツールか
 
-山形県米沢市の「滞在人口 / From-to（流入元）/ 宿泊者数」を公的オープンデータから取得し、
-**列名が固定された3つのCSV**（`resas-stay.csv` / `resas-fromto.csv` / `resas-lodging.csv`）を
+山形県米沢市の「滞在人口 / From-to（流入元）/ 宿泊者数 / クレジットカード消費額 / 旅行単価」を
+公的オープンデータから取得し、**列名が固定された7つのCSV**
+（`resas-stay.csv` / `resas-fromto.csv` / `resas-lodging.csv` /
+`resas-cc-area.csv` / `resas-cc-category.csv` / `resas-consumption-domestic.csv` /
+`resas-spend-per-trip.csv`）を
 `data/raw/resas/` に生成する（出力先は `cli.DEFAULT_OUT`。`--out` で変更可）。
 同名の `.md`（出典・制約）も同じディレクトリに並べて出す。
 列仕様は `writers.HEADERS` が単一の情報源。
@@ -22,11 +25,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 .venv/bin/python -m pip install -e .
 
 # 実行
-.venv/bin/resas-automate fetch                        # 3種まとめて
-.venv/bin/resas-automate fetch --kind fromto -v       # 種別を絞る／詳細ログ
+.venv/bin/resas-automate fetch                        # 7種まとめて
+.venv/bin/resas-automate -v fetch --kind fromto       # 種別を絞る／詳細ログ（-v は fetch の前）
 .venv/bin/resas-automate fetch --kind lodging --lodging-area city   # 米沢市の月次宿泊者数
+.venv/bin/resas-automate fetch --kind cc-category --cc-year 2025 --cc-period all  # 2025年通年
 .venv/bin/resas-automate estat-meta                   # API側の分類コードを一覧
 .venv/bin/resas-automate estat-files                  # ファイル配布側の収録年月を一覧
+.venv/bin/resas-automate resas-visa-meta              # クレカ消費額の収録年・四半期を一覧
+.venv/bin/resas-automate fetch --kind spend-per-trip --spend-transition year  # 旅行単価の推移
 
 # 構文チェック（テストスイートは無い）
 .venv/bin/python -m compileall -q src
@@ -50,17 +56,36 @@ PYTHONPATH=src .venv/bin/python -m resas_automate fetch   # 一番手軽。CIで
 
 リポジトリを iCloud 同期外（例 `~/src/`）へ移すのが根本解決。
 
-## 前提：RESAS本体からは何も取れない
+## 前提：RESAS本体から取れるものと取れないもの
 
 これがこの設計全体の理由なので、最初に理解すること。
 
-- **RESAS-API は 2025-03-24 に提供終了**。
-- 現行 resas.go.jp は Next.js の完全クライアントレンダリングで、公開APIもサーバサイドHTMLも無い。
-- **現行RESASに From-to分析機能そのものが存在しない**（JSバンドルを全チャンク走査して
-  `fromto` / `流入` / `発地` / `滞在人口` すべて0ヒットを確認済み、2026-09時点）。
+- **旧RESAS-API（opendata.resas-portal.go.jp）は 2025-03-24 に提供終了**。復活しない。
+- 現行 resas.go.jp は Next.js の完全クライアントレンダリングで、サーバサイドHTMLは無い。
+- **現行RESASに From-to分析（滞在人口）機能そのものが存在しない**。
+  滞在人口・宿泊者数・From-to をRESASから取る道は無いので、
+  この3種のソースは**代替物**であり、RESASと同じ値は出ない。
 
-したがって全ソースは**代替物**であり、RESASと同じ値は出ない。
-「RESASから取る」方向の実装を新たに足そうとしないこと。時間の無駄になる。
+**ただし2026-06-18のRESAS刷新で「クレジットカード消費地分析／消費額分析」が新設された。**
+これだけは現行RESASそのものの値を直接取れる（次節）。
+つまり「RESASからは何も取れない」は**もう正しくない**。新しい分析メニューが増えたときは
+JSバンドルを見て `api.resas.go.jp` を叩いているか確かめること。
+
+### 現行RESASの内部APIの調べ方
+
+`resas.go.jp` は Akamai 相当のbot対策が入っていて、**素の `curl -A "..."` は403を返す**
+（403でもSPAのシェルHTMLが返るので、雑に走査すると「0ヒット」という誤った結論が出る。
+以前この誤りをやっている）。次のヘッダが揃うと通る:
+
+```
+User-Agent: <ブラウザのUA>   Referer: https://resas.go.jp/
+Sec-Fetch-Dest: script       Sec-Fetch-Mode: no-cors   Sec-Fetch-Site: same-origin
+```
+
+- ルート一覧・チャンク一覧は `https://resas.go.jp/<route>/index.txt`（App RouterのRSCペイロード）。
+- 遅延チャンクのハッシュ表は `webpack-*.js` の `r.u=e=>...` に入っている。
+- 分析メニューのキー一覧（`tourism-credit-consumption-amount` など）は共通チャンクに
+  `{key:...,value:...}` の配列で入っている。
 
 ## アーキテクチャ
 
@@ -83,6 +108,8 @@ sources は互いに独立で、`cli.cmd_fetch` だけが束ねる。
 | `estat_lodging` | 2014-01〜2016-12 | 要 | e-Stat API（統計データベース） |
 | `estat_lodging_files`（宿泊者数） | 2015年〜**最新月** | 不要 | e-Stat ファイル配布のExcel |
 | `estat_lodging_files`（From-to） | 2015-04〜**最新月** | 不要 | 同上（参考第2表・居住地別） |
+| `resas_visa`（クレカ消費額） | 2025年〜**最新四半期** | 不要 | 現行RESASの内部API |
+| `resas_tourism_domestic`（旅行単価） | 2023〜2025年 | 不要 | 同上（ダウンロードZIP） |
 
 天井がバラバラなので `cli.select_year_months()` が**ソースごとに独立して**
 「今年 → 無ければ収録最新年」へフォールバックする。既定実行では stay=2021年、
@@ -97,6 +124,98 @@ lodging=最新年 と別々の年が出るのが正常。
 このギャップを埋めるのが `writers.sidecar_note()`。CSV本体は列仕様どおりに保ち、
 **出典・集計条件・制約は同名の `.md` に必ず書き出す**。
 新しい source を足すときも sidecar は必須。CSVだけ出して済ませないこと。
+
+### クレジットカード消費額（`resas_visa`）は現行RESASの内部APIから取る
+
+`resas-cc-area.csv` / `resas-cc-category.csv` / `resas-consumption-domestic.csv` の3つは、
+2026-06-18に新設された **RESAS「クレジットカード消費額分析」**（`/tourism-credit-consumption-amount`）
+そのものの値。画面が `https://api.resas.go.jp/v2/tourism/visa-spending/…` を叩いており、
+**鍵もログインもCookieも不要**。Seleniumも要らない。
+
+- データ提供は **Visa Consulting & Analytics**。JCB／ナウキャストだった旧・消費マップとは
+  **別系列で、値は接続しない**。sidecar に必ずそう書くこと。
+- `api.resas.go.jp` は **ブラウザのUA・`Origin`・`Referer` の3つが揃わないと403**。
+  どれか1つでも欠けると通らない（`resas_visa._HEADERS`）。この用途のために
+  `http.fetch` / `fetch_json` に `headers` 引数を足してある。
+- 使うエンドポイントは2つだけ。
+  `category-circle-bar`（費目大分類の円グラフ）と `to-bar`（消費地別ランキングの棒グラフ）。
+  他に `from-bar`（居住地別）・`*-line`（推移）・`day/time-*`（平日土日・時間帯）や、
+  `visa-flow/*`（入込人数・滞在時間・前後経路＝消費地分析側）もある。
+
+#### 返るのはデータ表ではなくECharts の option
+
+画面がグラフ描画に `optionUrl` を渡す作りなので、レスポンスは描画設定そのもの。
+
+- 円グラフ: `series[0].data[i].value` が実数、`name` は
+  `"宿泊費 14,090万円 (14.98%)"` という**表示用文字列**。分類名は最初の空白より前。
+- 棒グラフ: `xAxis.data` がラベル、`series[0].data[i].value` が値。
+- 単位は円グラフなら `title[0].text`、棒グラフなら `yAxis.name`（`（万円）`）。
+  **市区町村は万円、全国は百万円**とレベルで変わるので、必ず応答から読むこと。
+- **データが無い期間は 404 ではなく 200 + `{"option": {}}`**。ここを見落とすと空振りに気付けない。
+
+分類名・単位をハードコードしないのは e-Stat 側と同じ方針。
+
+#### パラメータは FastAPI の enum で守られている
+
+不正値を送ると 422 と一緒に **許容値の一覧が返ってくる**ので、仕様調査はこれが一番速い。
+
+```
+{"detail":[{"loc":["query","parameter"],"msg":"value is not a valid enumeration member;
+  permitted: 'value', 'transition'", ...}]}
+```
+
+`country` は必須で、全体なら `00`（全国籍・地域）。忘れると 422。
+
+#### 収録範囲と既定の期間
+
+四半期更新。実測（2026-09）で **2025年（月次・四半期・通年）と2026年 第1四半期のみ**、
+2024年以前は空。天井が動くので `resas_visa.resolve_year()` が実際に叩いて確かめる。
+
+`--cc-period auto`（既定）は **4四半期そろっていれば通年、欠けていれば収録最新の四半期**を選ぶ。
+`month=all` は「収録済みの四半期の合計」を返すだけなので、そのまま通年扱いすると
+1四半期分を1年分に見せてしまう。この分岐はそのために入っている。
+
+#### 消費地は市区町村までで、市内の地区別は無い
+
+`resas-cc-area.csv` の `消費地` は**決済が行われた市区町村**（既定は山形県内の全32市区町村）。
+「小野川温泉」「上杉神社周辺」のような市内の地区別内訳は**Visaデータに存在しない**。
+`--cc-area-level pref` にすると47都道府県になる。
+
+#### cc-category と consumption-domestic は同じAPIの別ラベル
+
+どちらも費目大分類の消費総額。違いは2点だけ:
+
+- `cc-category` は `--cc-visitor` で 国内／訪日 を切替、費目はRESASの正式名称
+  （宿泊費・飲食費・交通費・娯楽等サービス費・買物代・その他）。
+- `consumption-domestic` は**国内旅行に固定**、費目はダッシュボードの短縮表記
+  （宿泊・飲食・交通・娯楽・体験・土産・買物・その他）。対応表は `cli._SHORT_CATEGORY`。
+
+`--cc-visitor domestic` のとき両者の数値は同じになる。これは意図した重複で、
+ダッシュボード側が別パネルとして読むため。1回のAPI呼び出しを使い回している。
+
+### 旅行単価（`resas_tourism_domestic`）は配信元CSVをそのまま通す
+
+`resas-spend-per-trip.csv` は RESAS「国内観光消費分析」（`/tourism-domestic`）の
+**ダウンロードボタンと同じもの**。元データは **観光庁「旅行・観光消費動向調査」**で、
+Visaのクレカデータ（`resas_visa`）とは**別系列**。混同しないこと。
+
+- 経路は `https://api.resas.go.jp/v2/download{downloadUri}`。接続は `resas_api` 共通。
+- **応答はJSONではなくZIP**（`application/zip`）。中身は **Shift_JIS（cp932）のCSV1本**。
+  ZIP内のファイル名はUTF-8フラグ付きなので `zipfile` がそのまま復号する。
+- この種別だけ**値を組み立て直さない**。列は配信元のまま、UTF-8 BOMに置き直すだけ。
+  そのため `writers.write()` に `header=` を渡せるようにしてある
+  （**最終列だけが `単価（宿泊中）` / `単価（日帰り）` と旅行種類で変わる**ため）。
+  他の種別では使わないこと。HEADERS が単一の情報源という原則は崩していない。
+- **範囲外の年でも422にならず、見出しだけのCSV（289バイト・1行）が返る。**
+  データ行が0件かどうかでしか未収録を判定できない。`fetch_latest()` がそれをやる
+  （取得と判定を分けると同じZIPを2回落とすので1回にまとめてある）。
+- `--spend-transition year|quarter` にすると単年ではなく**収録全年の推移**が1本で返る。
+
+同じ画面の「都道府県別」タブには別のダウンロードURIがある（未実装）:
+`/tourism/tourism-domestic/prefecture/transition?pref=06&itemType=2` で
+**山形県の訪問目的×費目×年の旅行消費額（億円）**が返る。
+`itemType` は 0=訪問者数 / 1=消費単価 / 2=旅行消費額。
+`scripts/resas-process.py` の `build_pref()` が読む `resas-yamagata-*.csv` はこれ。
 
 ### e-Stat には「統計データベース」と「ファイル配布」の2経路がある
 
@@ -142,14 +261,25 @@ lodging=最新年 と別々の年が出るのが正常。
 **第1次速報値は候補に入れない**（`PREFER_PREF` / `PREFER_CITY`）。
 全国計しか無いので、最新月ほしさに入れると毎回ダウンロードして必ず空振りする。
 
-### From-to を最新化する手は無い（`--fromto-source lodging` は代用にならない）
+### From-to：公的統計側に手は無い。ただしRESASの新APIに有力な候補がある
 
-「宿泊と同じ要領で fromto も最新化できないか」は既に検討済み。結論は**できない**。
+「宿泊と同じ要領で fromto も最新化できないか」は検討済み。**公的統計側は行き止まり**:
 
 - **国勢調査 従業地・通学地集計は令和2年（2020年）が最新**。令和7年調査は実施済みだが
   この集計は未公表（令和2年は調査の約2年後に公表）。DBにもファイル配布にも無い。
 - **人流オープンデータは凍結**。山形県リソースの `last_modified` は 2022-01-13 で、
   中身は 2019〜2021 のまま（CKAN で確認済み）。2022年以降は存在しない。
+
+**未実装の有力候補（2026-09に発見）**: `resas_visa` で使っている同じRESAS内部APIに
+`v2/tourism/visa-flow/from-bar`（クレジットカード消費地分析の「居住地別 入込人数」）がある。
+実測で **米沢市・2025年通年・843市区町村・単位は人**が返る
+（山形市76,736 / 仙台市57,992 / 福島市48,068）。**自治体名単位・四半期更新**で、
+現状の census 経路（2020年の通勤・通学者数）より遥かに新しく、観光の人流に近い。
+
+ただし乗り換えるなら次を確認してから。値の性質が census とまったく違う:
+Visa会員の決済に基づく**推定居住地**であり、`滞在人口` でも実人数でもない。
+既知の不変条件（合計10,423）は当然崩れるので、検証値も差し替えること。
+パラメータは `visa-spending` と同じ（`country=00` 必須）。
 
 唯一「最新の流入元らしきもの」は宿泊旅行統計の**参考第2表（居住地47区分別延べ宿泊者数）**で、
 `--fromto-source lodging` で取れる。ただし**既定にはしない**。実測（2026年）での制約:
@@ -207,6 +337,26 @@ lodging=最新年 と別々の年が出るのが正常。
   `over10` とは別系列。**違って正しい**。
 - 2026-06 山形県（第2次速報・全施設）= **383,880 / 12,660**、
   同月の米沢市 = **15,163 / 191**。
+
+旅行単価（`resas_tourism_domestic`）:
+
+- 既定（2025年・すべての期間・宿泊旅行・旅行単価）は **48行**。
+  先頭 `2025,すべての期間,A,年齢,A01,9歳以下,48670`、末尾 `…,F,宿泊数,F08,8泊以上,86662`。
+- `--spend-cost-type 1`（購入者単価）は **36行**、`--spend-transition year` は **144行**（3年分）。
+- 2026年を指定すると未収録判定で2025年に落ちる（エラーにはならない）。
+
+クレジットカード消費額（`resas_visa`。ここは合計の一致が3重に効く）:
+
+- **費目別の合計 ＝ 消費地別ランキングの米沢市の値**（別エンドポイント同士の突き合わせ）。
+  2025年通年・国内旅行で **425,118万円**。ここがズレたら option の読み取りバグ。
+- **4四半期の合計 ＝ 通年**、**12か月の合計 ＝ 通年**。どちらも 425,118 になる
+  （四半期は 68,889 / 117,771 / 134,933 / 103,525）。
+- 2026年 1-3月期・国内旅行・米沢市 = **94,090万円**
+  （宿泊費14,090 / 飲食費16,943 / 交通費4,110 / 娯楽等サービス費16,600 / 買物代42,338 / その他9）。
+- 同期間の消費地別（山形県内32市区町村）は 山形市351,525 / 天童市115,946 / 米沢市94,090。
+- 2025年通年・**訪日旅行**・米沢市 = 12,021万円。RESAS画面の表示は 12,022万円 で、
+  **行ごとに整数へ丸めた差**。sidecar に自動で注記が入る（`Provenance.reported_total`）。
+  この1単位差は仕様であってバグではない。
 
 From-to:
 
